@@ -1,0 +1,19 @@
+# Secrets & env
+.env
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Artifacts / models / snapshots
+artifacts/
+data/snapshots/
+
+# Large reference dumps (provided out-of-band, never committed)
+UNI_BGMFILEDWITH.json
+response.json
+records.json

@@ -1,0 +1,156 @@
+PS E:\VS Code\GlowStar> (Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned) ; (& "e:\VS Code\GlowStar\.venv\Scripts\Activate.ps1")
+(.venv) PS E:\VS Code\GlowStar> pytest -q                                    # 93 tests
+.............................................................................................                                                                      [100%]
+(.venv) PS E:\VS Code\GlowStar> python -m glowstar.validation.engine_backtest  # accuracy gate
+==============================================================================
+GLOW STAR PRICING ENGINE — FINAL OUT-OF-TIME BACKTEST
+==============================================================================
+records: 28408 rows {'Sold': 20143, 'Stock': 8185, 'Transit': 80} | identity 20141/20143 exact (max abs err $0.0156) | FDiscount outliers flagged: 19
+
+Split @ 2026-05-01:  train=15,862  test=4,262  (leakage-free; recency-weighted; market-anchored; conformal bands)
+
+  ENGINE    MAE=4.99  MedAE=4.58  ±3=32.5%  ±5=54.7%  $MedAE=48  $MAE=119
+  BASELINE  MAE=7.36  MedAE=6.50  ±3=28.0%  ±5=42.3%  $MedAE=66  $MAE=178
+
+  -> engine beats baseline by 2.36 MAE pts (32.1% lower); signed bias +0.25
+  CONFIDENCE  target=80%  empirical=64.2%  median width=12.3 pts
+  METHODS  {'model+anchor': 4232, 'fallback': 30}
+  FLAGS    {'bgm_unassessed': 4262, 'high_value': 7, 'low_confidence': 30, 'rare_shape': 30, 'fancy_color': 3}
+
+PER-SHAPE:
+      shape    n  engine_mae  base_mae  engine_within5
+      Round 2594        4.59      8.81           0.596
+       Oval  681        4.69      4.52           0.559
+       Pear  368        6.48      4.66           0.342
+      Heart  201        5.74      5.88           0.498
+   Marquise  153        5.96      6.53           0.458
+    Emerald   92        6.08      5.01           0.413
+   Princess   77        5.02      6.48           0.532
+Sq. Emerald   42        7.67      2.19           0.143
+==============================================================================
+(.venv) PS E:\VS Code\GlowStar> python -m glowstar.validation.shadow           # go-live recommendation
+==========================================================================
+SHADOW MODE -- engine agreement with human pricers (attributes only)
+==========================================================================
+Overall: agree MAE=4.99  within +/-5 = 55%  mean gap=+0.21 pts
+Material divergences (>10 pts): 317 (7%) -> human review queue
+
+segment            n  agree_mae  within5  mean_gap  review  go-live
+Round           2594       4.48      61%     -2.31     136   YES
+Oval             681        4.7      56%      3.86      26   hold
+Pear             368       6.86      30%      5.43      59   hold
+Heart            201       5.76      50%      3.90      39   hold
+Marquise         153       5.97      45%      3.23      15   hold
+Emerald           92       7.33      39%      4.27      14   hold
+Princess          77       5.02      53%      3.88       9   hold
+Sq. Emerald       42        7.6      14%      7.60       8   hold
+
+Recommended go-live (high agreement): ['Round']
+Elsewhere: engine assists, human decides; divergences feed the feedback loop.
+==========================================================================
+(.venv) PS E:\VS Code\GlowStar> python -m glowstar.pipeline                     # ingest -> train -> price
+2026-06-18 14:17:12,045 WARNING Live pull unavailable (Missing required environment variable 'CHANNEL_PARTNER_USER'. Set it in .env (see .env.example); never hardcode secrets.); falling back to file source.
+2026-06-18 14:17:12,045 INFO Using shipped records.json
+2026-06-18 14:17:12,316 INFO records: 28408 rows {'Sold': 20143, 'Stock': 8185, 'Transit': 80} | identity 20141/20143 exact (max abs err $0.0156) | FDiscount outliers flagged: 19
+2026-06-18 14:17:12,328 INFO records: 28408 rows {'Sold': 20143, 'Stock': 8185, 'Transit': 80} | identity 20141/20143 exact (max abs err $0.0156) | FDiscount outliers flagged: 19
+2026-06-18 14:17:44,422 INFO Engine trained on 20,124 sold stones + 0 feedback records.
+{
+  "suggestion": {
+    "stone_id": "PIPELINE-DEMO",
+    "suggested_discount": -54.51,
+    "suggested_ppc": 3730.05,
+    "suggested_net": 3767.35,
+    "ci_discount_low": -59.77,
+    "ci_discount_high": -46.38,
+    "ci_net_low": 3332.07,
+    "ci_net_high": 4440.55,
+    "comparable_count": 787,
+    "market_median_discount": -44.0,
+    "method": "model+anchor",
+    "flags": [
+      "bgm_unassessed"
+    ],
+    "market_direction": "softening",
+    "trend_shift_pts": 0.0,
+    "bgm_state": "unassessed",
+    "bgm_deduction_pts": 0.0,
+    "assumes_no_bgm": true,
+    "feedback_correction_pts": 0.0,
+    "coverage_pct": 80
+  },
+  "market": {
+    "internal_trend": {
+      "monthly_index": {
+        "2025-12": -1.3,
+        "2026-01": -2.59,
+        "2026-02": -1.84,
+        "2026-03": 0.98,
+        "2026-04": 5.47,
+        "2026-05": 3.53,
+        "2026-06": 0.65
+      },
+      "recent_slope_pts_per_month": -2.41,
+      "last_observed_month": "2026-06",
+      "direction": "softening"
+    },
+    "macro": {
+      "overall_direction": "softening",
+      "headline": "Natural-diamond market in multi-year decline; rate of decline easing into 2026.",
+      "signals": [
+        {
+          "metric": "RAPI 1ct (round)",
+          "value": "-30% since early 2024; -9.9% in 2025",
+          "as_of": "2026-01",
+          "direction": "down",
+          "source": "rapaport.com price-index releases (FY2024/FY2025/Jan2026)",
+          "note": "Small goods hit hardest: 0.30ct -20%, 0.50ct -26% in 2025; 3ct+ roughly flat."
+        },
+        {
+          "metric": "RAPI decline easing",
+          "value": "-1.3% in Jan 2026 (0.30ct/1ct)",
+          "as_of": "2026-02",
+          "direction": "down",
+          "source": "rapaport.com 'Decline Eases' (Feb 4 2026)",
+          "note": "Rate of decline slowing; small goods possibly stabilizing into 2026."
+        },
+        {
+          "metric": "Lab-grown share (US engagement)",
+          "value": "61% (2025), up from 52% (2024)",
+          "as_of": "2026-01",
+          "direction": "down",
+          "source": "The Knot 2025/26 jewelry studies",
+          "note": "Substitution is the structural driver pulling natural prices down."
+        },
+        {
+          "metric": "US tariffs on Indian goods",
+          "value": "25% (Aug 7 2025) -> 50% (Aug 27 2025)",
+          "as_of": "2025-08",
+          "direction": "down",
+          "source": "GJEPC / JCK Feb 2026",
+          "note": "Triggered the H2-2025 price shock; natural-diamond relief prospective/unsigned."
+        },
+        {
+          "metric": "G7 origin due-diligence",
+          "value": "Statement required for natural polished >=0.5ct",
+          "as_of": "2026-01",
+          "direction": "flat",
+          "source": "AWDC traceability update (Jan 1 2026)",
+          "note": "Paper-based, not a blockchain mandate; Tracr is voluntary. Compliance cost, not a price driver yet."
+        }
+      ],
+      "as_of": "2026-02"
+    },
+    "cross_check": {
+      "internal_direction": "softening",
+      "macro_direction": "softening",
+      "agree": true,
+      "note": "Internal trend and external macro view agree."
+    }
+  },
+  "explanation": {
+    "text": "Suggested -54.5% off Rap ($3,730/ct, $3,767 net), with an 80% confidence range of -59.8% to -46.4%. The market shows 787 comparable stones clustering near -44.0% off Rap. Flags: bgm_unassessed.",
+    "source": "template",
+    "guard_ok": true
+  }
+}
+(.venv) PS E:\VS Code\GlowStar> 

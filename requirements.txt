@@ -1,0 +1,10 @@
+# Core data + ML stack. Pinned to the versions validated on Python 3.14.
+numpy==2.4.6
+pandas==3.0.3
+scikit-learn==1.9.0
+pydantic==2.13.4
+python-dotenv==1.0.1
+requests==2.32.3
+
+# Dev / test
+pytest==9.1.0
