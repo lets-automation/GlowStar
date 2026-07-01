@@ -152,8 +152,11 @@ def aggregate(path: Path | None = None, limit: int | None = None) -> dict:
             by_shade[shade][b] += 1
 
             # Anchor uses CLEAN stones only (no BGM, no milky, neutral/none shade).
+            # Pass cut so the banked market is CUT-AWARE: a VG stone matches the VG
+            # market (which trades ~10 pts deeper) instead of the EX-dominated blend.
             if is_bgm != "Yes" and milky == "none" and shade in ("none", "neutral"):
-                for key in segment_keys(shape, w, color, clarity):
+                cut = item.get("cut") or item.get("cutShortTitle")
+                for key in segment_keys(shape, w, color, clarity, cut):
                     clean_hist[key][b] += 1
 
             if n_seen % 250_000 == 0:

@@ -15,8 +15,8 @@ import requests
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 25      # fail fast; the live market layer falls back to banked data
-MAX_RETRIES = 2
+DEFAULT_TIMEOUT = 45      # full-bracket market pulls can be large; give them room
+MAX_RETRIES = 3           # before falling back to banked data
 BACKOFF_BASE = 1.5
 
 

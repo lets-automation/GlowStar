@@ -77,8 +77,11 @@ def run_backtest(split_date: str | None = None) -> dict:
     base_pred = base.predict(test)
 
     # --- Model (quantile GBM) ---
-    x_train, y_train = build_features(train), get_target(train)
-    x_test = build_features(test)
+    # Freeze the market_month_index origin to the training epoch so train and
+    # test share one time scale (no per-frame origin reset).
+    month_base = train["MarketSheetDate_dt"].min()
+    x_train, y_train = build_features(train, month_base), get_target(train)
+    x_test = build_features(test, month_base)
     weights = recency_weights(train, split_date)
     gbm = QuantileGBM().fit(x_train, y_train, sample_weight=weights)
     lo, mid, hi = gbm.predict_interval(x_test)

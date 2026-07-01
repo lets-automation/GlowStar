@@ -55,7 +55,7 @@ def normalize_uni_stone(raw: dict) -> dict:
     price = raw.get("price") or {}
     lab = raw.get("lab")
     lab_name = lab.get("lab") if isinstance(lab, dict) else lab
-    cert = (raw.get("certificateNumber") or raw.get("certificate_number") or "").strip()
+    cert = str(raw.get("certificateNumber") or raw.get("certificate_number") or "").strip()
     uid = cert or str(raw.get("diamondID") or raw.get("stone_uni_id") or "")
     disc = raw.get("stone_discount")
     if disc is None:
@@ -70,6 +70,7 @@ def normalize_uni_stone(raw: dict) -> dict:
         "size": raw.get("size"),
         "color": raw.get("color"),
         "clarity": raw.get("clarity"),
+        "cut": raw.get("cut") or raw.get("cutShortTitle"),   # cut grade (EX/VG/GD) — moves price a lot
         "lab": lab_name,
         "fluorescence": fl_int,
         "cert_date": _parse_date(raw.get("stone_cert_date")

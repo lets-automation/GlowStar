@@ -7,6 +7,7 @@ dict. This is the callable the REST layer (service/app.py) wraps.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 
 import pandas as pd
@@ -14,9 +15,18 @@ from pydantic import BaseModel, Field
 
 from ..data.loaders import load_records, sold_stones
 from ..models.engine import PricingEngine, EngineConfig
+from ..models import registry
 from ..narration.narrate import narrate
 from ..feedback import store as fbstore
 from ..feedback.learning import build_corrections, reason_summary
+from ..reference.rap_versioning import RapChangeMonitor
+
+log = logging.getLogger(__name__)
+
+# How much to widen the confidence band (each side, discount points) while a
+# stone's Rap cell is inside the post-change adjustment window — the market level
+# is genuinely less certain there, so the band must say so.
+_RAP_CHANGE_CI_WIDEN_PTS = 4.0
 
 
 class StoneIn(BaseModel):
@@ -38,12 +48,24 @@ class StoneIn(BaseModel):
 
 
 class PricingService:
-    def __init__(self, engine: PricingEngine | None = None, use_feedback: bool = True):
+    def __init__(self, engine: PricingEngine | None = None, use_feedback: bool = True,
+                 prefer_registry: bool = True, rap_monitor: RapChangeMonitor | None = None):
         self._feedback = fbstore.load_all() if use_feedback else []
+        # Rap-change "red line": flags a stone whose Rap cell just moved and widens
+        # its band during the adjustment window. Inert until >=2 list versions are
+        # ingested (see reference.rap_versioning) — never guesses a change.
+        self._rap_monitor = rap_monitor if rap_monitor is not None else RapChangeMonitor()
+        # Prefer a gated, versioned model from the registry (fast start, audited)
+        # over retraining in memory. The nightly retrain job promotes it.
+        if engine is None and prefer_registry:
+            engine, card = registry.load_current()
+            if engine is not None:
+                log.info("Loaded live model %s from registry (test MAE=%s).",
+                         (card or {}).get("version"), (card or {}).get("test_mae"))
         if engine is None:
             df, _ = load_records()
             sold = sold_stones(df, drop_outliers=True)
-            # Production model: train on ALL sold history + human feedback labels.
+            # Cold start: train on ALL sold history + human feedback labels.
             engine = PricingEngine(EngineConfig()).fit(sold, feedback_records=self._feedback)
         self.engine = engine
         self._asof = engine._train_max_date
@@ -61,10 +83,31 @@ class PricingService:
         suggestion = self.engine.predict(df)[0]
         facts = asdict(suggestion)
         facts["coverage_pct"] = int(self.engine.cfg.coverage * 100)
+        rap_change = self._apply_rap_change(facts, stone)
         out = {"suggestion": facts, "market": self._market_context()}
+        if rap_change is not None:
+            out["rap_change"] = rap_change
         if explain:
             out["explanation"] = narrate(facts)
         return out
+
+    def _apply_rap_change(self, facts: dict, stone: StoneIn) -> dict | None:
+        """If the stone's Rap cell recently moved, attach the red-line info and,
+        while inside the adjustment window, widen the band and flag it. The
+        suggested DISCOUNT is unchanged (it already applies to the current Rap);
+        only the stated uncertainty grows, honestly, until the level re-settles."""
+        info = self._rap_monitor.check(stone.Shape_full, stone.Weight, stone.Color, stone.Clarity)
+        if not info.changed:
+            return None
+        if info.in_window:
+            w = _RAP_CHANGE_CI_WIDEN_PTS
+            facts["ci_discount_low"] = round(facts["ci_discount_low"] - w, 2)
+            facts["ci_discount_high"] = round(facts["ci_discount_high"] + w, 2)
+            rap, wt = stone.Rap, stone.Weight
+            facts["ci_net_low"] = round(rap * (1 + facts["ci_discount_low"] / 100.0) * wt, 2)
+            facts["ci_net_high"] = round(rap * (1 + facts["ci_discount_high"] / 100.0) * wt, 2)
+            facts["flags"] = sorted(set(facts.get("flags", []) + ["rap_recently_changed"]))
+        return info.as_dict()
 
     def _market_context(self, include_macro: bool = False) -> dict:
         """Market context for a price. By default only REAL, data-derived signals

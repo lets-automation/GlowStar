@@ -116,8 +116,8 @@ _LEGEND = [
     ("SUGGESTED Disc% / Net$", "REAL model output — leakage-free quantile GBM trained only on "
      "EARLIER sales, then market-anchored + trend-adjusted. Never saw this stone's outcome."),
     ("Disc Error / Net Error", "COMPUTED — suggestion minus actual. The honest accuracy signal."),
-    ("CI Low/High, Actual in band?", "REAL — conformal 80% interval. Note: empirical coverage is "
-     "~64% on 6 months of out-of-time data (stated honestly), tightens as data accrues."),
+    ("CI Low/High, Actual in band?", "REAL — conformal 80% interval. Empirical coverage is "
+     "~76.5% on 6 months of out-of-time data (stated honestly), tightens as data accrues."),
     ("Method", "REAL — 'model+anchor' = model + live market anchor; 'fallback' = sparse-data "
      "hierarchical estimate (rare shape / fancy color), human review."),
     ("Market comps (n) / Market median Disc%", "REAL — from the Uni market dump (268,815 UNIQUE "
@@ -125,8 +125,9 @@ _LEGEND = [
     ("BGM state / deduction", "REAL logic. State is 'unassessed' for ALL client stones because "
      "records.json has NO BGM fields yet. Deduction = 0 until BGM is captured. The deduction "
      "VALUES (milky -5/-10/-11, shade -6) are REAL, learned from the Uni market dump."),
-    ("Trend shift(pts)", "REAL — damped forward de-bias from the internal price index. 0 here "
-     "because these stones are priced as-of their own sale month (no forward gap)."),
+    ("Trend shift(pts)", "REAL — the internal price index now drives only the Market-direction "
+     "narration; it is NOT added to price (the fixed time feature already carries the trend, so "
+     "applying it again double-counted). Shown as 0 by design."),
     ("Feedback corr(pts)", "REAL — online correction from human overrides. 0 here because no "
      "feedback has been recorded yet (empty decisions log)."),
     ("Market direction", "REAL — computed from the client's own quality-adjusted sales index."),
@@ -135,25 +136,34 @@ _LEGEND = [
 ]
 
 _HONESTY = [
-    ("Model training", "COMPLETE & WORKING. Trains in ~30s on load; reproducible. NOTE: the model "
-     "is retrained in-memory on startup, not yet saved to disk as a versioned artifact."),
+    ("Model accuracy", "COMPLETE & WORKING. Out-of-time MAE 3.60 discount pts (51% better than the "
+     "baseline); Round MAE 2.88. Coverage 76.5% vs 80% target. Reproducible: engine_backtest."),
+    ("Model training & versioning", "WORKING. Nightly retrain with an accuracy PROMOTION GATE "
+     "(a worse model is never promoted); each model is saved immutably under artifacts/models/ "
+     "with its metrics card; serving loads the gated model. Live-trained (proven end to end)."),
     ("Leakage control", "WORKING. Forbidden/transaction columns physically cannot enter the model "
-     "(guard raises). Validation is out-of-time. The accuracy here is honest."),
-    ("Market data (Uni)", "REAL but FROM ONE BANKED SNAPSHOT (the 6.2GB dump, ~3-Jun-2026). The "
-     "anchor, comparables and BGM deltas are computed from its 268,815 unique stones. Live "
-     "re-pulling is NOT happening — no Uni API credentials are set."),
+     "(whitelist guard raises). Validation is out-of-time, hyperparameters tuned on an inner "
+     "validation window (never the test set). The accuracy here is honest."),
+    ("Market data (Uni)", "REAL. Banked report uses the 6.2GB dump's 268,815 unique stones (after "
+     "removing ~90% duplicate re-listings); the LIVE report (live_report.py) pulls fresh Uni "
+     "comparables per stone. Uni API is verified live."),
     ("Market RESEARCH (macro: RAPI, lab-grown, tariffs, G7)", "SEEDED / HARDCODED from web research "
      "(provenance-tagged with sources & dates in market/context.py). These are accurate real-world "
      "facts as compiled 2026-06, NOT a live feed. They are surfaced & cross-checked, never fed as "
      "silent model inputs. To be refreshed from source on each cycle."),
     ("Internal trend index", "REAL — computed live from the client's own sales each run."),
-    ("Live API ingestion (4 APIs)", "BUILT & TESTED (mocked), NOT RUNNING — credentials in the docx "
-     "are compromised and not set. Pipeline falls back to shipped records.json (see terminal.log)."),
-    ("Daily snapshot job", "BUILT, NOT SCHEDULED — needs live credentials; one command + cron line."),
-    ("Uni request codebook", "PARTIALLY CONFIRMED only (shape/color=D/clarity=IF,VVS1/lab=GIA/"
-     "fluor/country). Unconfirmed codes FAIL LOUD by design — must be confirmed before live queries."),
-    ("BGM on client stones", "NOT AVAILABLE — records.json has no BGM fields, so every client stone "
-     "is 'unassessed' (priced on the No-BGM clean base, flagged). Recommend capturing it in the CRM."),
+    ("Live API ingestion (4 APIs)", "VERIFIED WORKING (2026-06-19): Channel Partner 28,090 records, "
+     "Diamanto token, Uni market live. Credentials in .env (git-ignored). The retrain job consumes "
+     "the live pull; serving prefers the gated model."),
+    ("Daily snapshot job", "BUILT — schedule with one cron/Task Scheduler line. Each pull is banked "
+     "immutably; the retrain unions sold history across snapshots (recovers the API's rolling window)."),
+    ("Uni request codebook", "EMPIRICALLY CALIBRATED against the live API (shape/color/clarity/lab/"
+     "fluor). Unconfirmed codes FAIL LOUD by design — never a silent wrong query."),
+    ("BGM on client stones", "'unassessed' for every client stone — and that is HONEST, not a gap "
+     "we skipped. BGM is not on GIA/IGI certs, records.json has no BGM field, and it cannot be "
+     "matched from Uni (the live feed blanks the certificate number; the bulk dump's certs don't "
+     "match the client's GIA numbers — 0 of 28,053 matched). So each stone is priced on the No-BGM "
+     "clean base and flagged. The ONLY fix is capturing milky/shade/eye-clean in the CRM."),
     ("Feedback loop", "WORKING — but the decisions log is empty (no human decisions recorded yet)."),
     ("Inventory & Gap engines (2 & 3)", "NOT BUILT — out of scope until the Pricing Engine is signed off."),
     ("Nothing is faked", "No random/placeholder numbers anywhere. Every value is computed from real "

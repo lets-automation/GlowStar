@@ -55,7 +55,7 @@ def test_engine_beats_baseline_threshold(trained):
     sugg = eng.predict(test)
     pred = np.array([s.suggested_discount for s in sugg])
     mae = M.compute(pred, test).mae
-    assert mae < 6.0           # engine measured ~5.0; baseline ~7.4
+    assert mae < 4.5           # engine measured ~3.6 (tuned); baseline ~7.4 — locks in the gain
     assert not math.isnan(mae)
 
 

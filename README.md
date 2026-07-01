@@ -37,22 +37,32 @@ Train on sales **before 2026-05-01**, test on **May–Jun 2026**. Target =
 | | MAE (disc pts) | within ±5 | $ median err | signed bias |
 |---|---|---|---|---|
 | Hierarchical-median **baseline** | 7.36 | 42.3% | $66 | — |
-| **Pricing Engine** | **4.99** | **54.7%** | **$48** | **+0.25** |
+| **Pricing Engine** | **3.60** | **73.8%** | **$32** | **+1.06** |
 
-- **32.1% lower error than the baseline**, provable not asserted.
+- **51% lower error than the baseline**, provable not asserted. Round (≈60% of
+  the book): **MAE 2.88, ±5 = 83%**.
 - Built up in measured layers (each verified on the out-of-time backtest):
-  leakage-free GBM (MAE 5.94) → recency weighting (5.62) → **Uni market anchor**
-  (5.10, cut Round 8.81→4.59) → **damped market trend** (bias → ~0).
+  leakage-free GBM → recency weighting → **segment-aware Uni market anchor**
+  (per-segment asking→realized offset, shrunk to global) → **fixed
+  `market_month_index`** time feature. The earlier explicit "market-trend shift"
+  was **removed**: once the time feature is fixed it double-counts (it had been
+  injecting a +bias and breaking interval coverage). Simpler *and* more accurate.
+- Hyperparameters (`anchor_lambda`, `recency_half_life`) selected on an **inner
+  validation window (April), never the test set** — `glowstar.validation.tune`.
 - Trained on **all** sold history (production-correct), recency-weighted, with
   human-feedback labels folded in.
-- Confidence interval (rolling-origin conformal): **target 80%, empirical 64%.**
-  Honest gap — 6 months out-of-time across a market regime shift means the
-  calibration window under-represents test dispersion; it tightens as the daily
-  snapshot job banks data. Point accuracy is unaffected (see *Limitations*).
+- Confidence interval (rolling-origin conformal): **target 80%, empirical 76.5%**
+  — up from 64%; the `market_month_index` fix removed the miscalibration. Tightens
+  further as the daily snapshot job banks data.
+- **Shadow mode clears 5 shapes for go-live** (Round, Oval, Heart, Emerald,
+  Princess); Pear / Sq.Emerald stay human-reviewed (they don't yet beat the
+  segment median). Material divergences: 3% of the book → review queue.
 
 Reproduce:
 ```bash
 python -m glowstar.validation.engine_backtest      # final engine vs baseline, per-shape
+python -m glowstar.validation.tune                 # inner-validation tuning (no test leakage)
+python -m glowstar.validation.shadow               # per-shape go-live recommendation
 python -m glowstar.validation.backtest             # model-only ablation
 ```
 
@@ -139,13 +149,31 @@ schtasks /Create /SC DAILY /ST 02:00 /TN GlowStarSnapshot \
 # or cron:  0 2 * * *  .venv/bin/python -m glowstar.ingestion.run_snapshot
 ```
 
+## Live training, scheduled retrain & a model registry
+
+The model should not be frozen — the market is moving. The retrain job pulls live,
+**unions the sold history across every banked snapshot** (the live `GetAllRecord`
+serves a rolling window — verified live 19,579 sold vs an earlier 20,143 — so a
+single pull silently drops the oldest sales; unioning the immutable snapshots is
+what actually *grows* the trainable history), retrains, evaluates leakage-free,
+and **promotes the new model only if it matches/beats the incumbent** — so a bad
+data day can never silently degrade live pricing. Promoted models are versioned
+immutably under `artifacts/models/<version>/` with an accuracy card; serving loads
+the gated model instead of retraining on boot.
+
+```bash
+python -m glowstar.training.retrain                # pull → assemble → train → GATE → promote
+# schedule nightly, after the snapshot pull:
+#   0 3 * * *  .venv/bin/python -m glowstar.training.retrain
+```
+
 ## Setup
 
 ```bash
 python -m venv .venv && . .venv/Scripts/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env                                  # fill in rotated secrets
-pytest                                                # 93 tests
+pytest                                                # 104 tests
 ```
 
 Python 3.12+ (developed on 3.14). No GPU; scikit-learn `HistGradientBoosting`.
@@ -167,17 +195,18 @@ then `POST /price`; OpenAPI at `/docs`.
 | Path | Purpose |
 |---|---|
 | `glowstar/reference/` | Deterministic Rap lookup + value normalization (foundation) |
-| `glowstar/data/` | Validated record loading; leakage definitions |
-| `glowstar/features/` | Leakage-free feature matrix + forbidden-feature guard |
-| `glowstar/market/` | Uni codebook, 6.2GB aggregator, anchor + soft deltas, **trend index**, **macro context**, **authenticity**, **BGM-as-base** |
-| `glowstar/models/` | Baseline+fallback, quantile GBM, the `PricingEngine` orchestrator |
+| `glowstar/data/` | Validated record loading; leakage definitions; **snapshot-history assembly** |
+| `glowstar/features/` | Leakage-free feature matrix + **whitelist** leakage guard; fixed time feature |
+| `glowstar/market/` | Uni codebook, 6.2GB aggregator, **segment-aware anchor** + soft deltas, trend index (direction narration), **macro context (+staleness guard)**, **authenticity**, **BGM-as-base**, **pluggable sources** (Uni; RapNet/IDEX-ready) |
+| `glowstar/models/` | Baseline+fallback, quantile GBM, the `PricingEngine` orchestrator, **versioned registry** |
 | `glowstar/feedback/` | Immutable decision store + reason codes + online/durable learning |
 | `glowstar/ingestion/` | Four API connectors + immutable snapshot store + recurring job |
-| `glowstar/validation/` | Out-of-time backtest + **shadow mode** + metrics |
+| `glowstar/training/` | **Nightly retrain with an accuracy promotion gate** |
+| `glowstar/validation/` | Out-of-time backtest + **inner-validation tuner** + **shadow mode** + metrics |
 | `glowstar/narration/` | LLM explanation + the number guard |
-| `glowstar/service/` | Typed `PricingService` (+ market context + feedback) + FastAPI app |
+| `glowstar/service/` | Typed `PricingService` (registry-backed) + market context + feedback + FastAPI app |
 | `glowstar/pipeline.py` | End-to-end: ingest (live/file) → train → serve |
-| `tests/` | 93 tests incl. Rap-core anchors, leakage guard, engine guardrails, feedback, mocked connectors |
+| `tests/` | 104 tests incl. Rap-core anchors, leakage guard, engine guardrails, feedback, retrain/registry, market sources, mocked connectors |
 
 See **[TESTING.md](TESTING.md)** for the complete end-to-end testing guide and
 go-live acceptance gates.
@@ -185,10 +214,9 @@ go-live acceptance gates.
 ## Honest limitations (surfaced, not hidden — brief §14)
 
 - **6 months of history.** No seasonality is learnable yet; out-of-time interval
-  calibration sits at ~64% vs 80% target — the rolling-origin conformal window
-  can't fully see the test-period regime shift on so little data. Point accuracy
-  is unaffected. **Mitigation: the recurring immutable snapshot job (built) must
-  be scheduled from day one** against live credentials; coverage tightens as the
+  calibration is **76.5% vs 80% target** (up from 64% after the `market_month_index`
+  fix). **Mitigation: the recurring immutable snapshot job (built) must be
+  scheduled from day one** against live credentials; coverage tightens as the
   series grows.
 - **Uni request codebook is now EMPIRICALLY VERIFIED against the live API**
   (`market.calibrate_codebook` -> `artifacts/uni_codebook.json`): shape, color
@@ -200,9 +228,11 @@ go-live acceptance gates.
   the CRM. The pipeline already has the slots.
 - **The 6.2GB market dump is truncated** at the tail; the aggregator uses all
   complete records (2.68M) and records `truncated_source: true`.
-- **Live APIs are connected and working.** All four endpoints authenticate from
-  `.env` and return live data (Channel Partner ~28.3k records, Diamanto token +
-  410k grid cells, Uni market live). Credentials live only in `.env`, never in
-  code. Rotate before wider production rollout.
+- **Live APIs verified working (2026-06-19).** All endpoints authenticate from
+  `.env` and return live data: Channel Partner **28,090 records** (Sold 19,579 /
+  Stock 8,511 — a rolling window, see *Live training* above), Diamanto token OK,
+  Uni market live (e.g. 482 comps for Round 1.0–1.09 G VS2 GIA). The nightly
+  retrain consumes this; serving prefers the gated registry model. Credentials
+  live only in `.env` (git-ignored), never in code.
 - **Rare shapes / fancy colors / oversize / the 6–9.99ct gap** never get a silent
   number — they route to fallback or return an explicit status for human review.

@@ -26,7 +26,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from ..config import SETTINGS
 from ..features.build import build_features, get_target
 from ..reference.normalize import is_white_grid_color
-from ..market.anchor import MarketTables, calibrate_offset, anchor_predictions, market_series
+from ..market.anchor import MarketTables, calibrate_offsets, anchor_predictions, market_series
 from ..market.index import MarketIndex
 from ..market.bgm import assess as bgm_assess
 from ..feedback.learning import build_corrections, correction_for, as_training_examples
@@ -60,14 +60,37 @@ class PriceSuggestion:
 @dataclass
 class EngineConfig:
     split_date: str = SETTINGS.backtest_split_date
-    anchor_lambda: float = 0.35       # blend weight (measured best on backtest)
-    conformal_days: int = 30          # recent slice held out to calibrate bands
+    # Market-anchor blend weight: final = (1-lam)*model + lam*market.
+    # CLIENT DECISION (reviewed the flow): price 50/50 — half their own history
+    # (the model), half the live market. lam=0.50. (Inner-validation favoured a
+    # lower 0.25 for matching PAST realized discounts; the client deliberately
+    # weights the live market higher for more market-responsiveness — a valid
+    # trade of backtest fit for tracking the current market.)
+    anchor_lambda: float = 0.50
     coverage: float = SETTINGS.interval_coverage
-    recency_half_life: float = 45.0      # measured best out-of-time on this data
+    recency_half_life: float = 30.0      # days; down-weights older sales (inner-validation best)
     min_segment_samples: int = SETTINGS.min_segment_samples
-    # Market-trend (directional) layer. Damped on purpose: naive extrapolation
-    # overshoots a mean-reverting market (measured). Capped to bound projection.
-    use_trend: bool = True
+    # Per-segment asking->realized offset: own calibration for liquid segments,
+    # shrunk to the global offset by sample size for thin ones.
+    anchor_offset_min_n: int = 25
+    anchor_offset_shrink_k: float = 40.0
+    # MARKET-LED forward pricing. Default off (the backtest predicts the client's
+    # PAST realized, history-first). For pricing NEW stones to sell, set True: the
+    # price tracks the clean, CUT+4C-matched current market (where it exists),
+    # with the model only as a fallback for stones with no cut-matched market.
+    # This is what the client actually does — they price to their live UNI view.
+    market_led: bool = False
+    # For FORWARD LIST pricing (a new stone the client will LIST/advertise), the
+    # client wants the market ASKING level, not the deeper expected-realized close.
+    # When False, the asking->realized offset is NOT applied, so the market anchor
+    # stays at the asking/list level. Keep True for valuing past/realized prices.
+    apply_asking_offset: bool = True
+    # Explicit market-trend (directional) projection. OFF by default: the FIXED
+    # market_month_index feature already carries the time trend into the GBM, and
+    # an extra projected shift double-counts it (measured: it re-introduced a
+    # large +bias and broke interval coverage, MAE 3.9->5.1). The index is still
+    # fit for the market_direction narration; the flag stays for ablation only.
+    use_trend: bool = False
     trend_damping: float = 0.5
     trend_cap_pts: float = 6.0
 
@@ -81,11 +104,12 @@ class PricingEngine:
         self.index: MarketIndex | None = None
         self.corrections: dict[str, dict] = {}     # per-segment offsets from feedback
         self._shape_counts: dict[str, int] = {}
-        self._offset: float = 0.0
+        self._offset: dict = {}                     # per-segment asking->realized offsets
         self._q_lo: float = 0.0        # conformal residual quantiles (signed)
         self._q_hi: float = 0.0
         self._train_max_date: pd.Timestamp | None = None
         self._train_ref_month: pd.Period | None = None
+        self._month_base: pd.Timestamp | None = None   # frozen market_month_index origin
 
     # --- training ---
     def fit(self, train: pd.DataFrame, feedback_records: list[dict] | None = None) -> "PricingEngine":
@@ -107,9 +131,14 @@ class PricingEngine:
             full, weight_mult = train, np.ones(len(train))
 
         self._train_max_date = full["OrderDate_dt"].max()
+        # Freeze the market_month_index origin to the training epoch so train,
+        # test, conformal, and serving all share one time scale.
+        self._month_base = full["MarketSheetDate_dt"].min()
         self._shape_counts = train["Shape_full"].value_counts().to_dict()
         self.fallback.fit(full)
-        self._offset = calibrate_offset(full, self.tables)
+        self._offset = calibrate_offsets(full, self.tables,
+                                         min_n=self.cfg.anchor_offset_min_n,
+                                         shrink_k=self.cfg.anchor_offset_shrink_k)
 
         # Market-trend (directional) layer: quality-adjusted index on train.
         self._train_ref_month = self._train_max_date.to_period("M")
@@ -120,7 +149,7 @@ class PricingEngine:
         age = (self._train_max_date - full["OrderDate_dt"]).dt.days.to_numpy().astype(float)
         weights = (0.5 ** (age / self.cfg.recency_half_life)) * weight_mult
         self.gbm = QuantileGBM(coverage=self.cfg.coverage).fit(
-            build_features(full), get_target(full), sample_weight=weights)
+            build_features(full, self._month_base), get_target(full), sample_weight=weights)
 
         # Confidence bands via rolling-origin (forward) conformal calibration:
         # pooled residuals of the full anchored+trend pipeline predicting unseen
@@ -144,8 +173,8 @@ class PricingEngine:
                 loss="quantile", quantile=0.5, learning_rate=0.06, max_iter=300,
                 max_leaf_nodes=31, min_samples_leaf=40, l2_regularization=1.0,
                 categorical_features="from_dtype", random_state=42)
-            tmp.fit(build_features(past), get_target(past), sample_weight=w)
-            raw = tmp.predict(build_features(block))
+            tmp.fit(build_features(past, self._month_base), get_target(past), sample_weight=w)
+            raw = tmp.predict(build_features(block, self._month_base))
             anchored = anchor_predictions(raw, block, self.tables, self._offset,
                                           lam=self.cfg.anchor_lambda)
             final = anchored + self._trend_shift(block, None)
@@ -162,10 +191,41 @@ class PricingEngine:
         self.corrections = table or {}
 
     # --- internal: model point prediction, anchored ---
+    def _model_fluor_penalty(self, df: pd.DataFrame) -> np.ndarray:
+        """The MODEL's own fluorescence penalty per stone (<=0 = deeper for fluoro):
+        model(actual) - model(fluoro=None). Applied to the fluorescence-BLIND market
+        anchor so the market doesn't dilute the fluoro penalty the model already
+        learned. Self-calibrating — matches the model (and the client), whereas the
+        broad market over-penalises fluorescence."""
+        if "Fluorescence" not in df.columns:
+            return np.zeros(len(df))
+        fl = df["Fluorescence"].astype("string").str.strip().str.lower()
+        is_fl = ~fl.isin(["non", "none", "nan", ""]) & fl.notna()
+        if not bool(is_fl.any()):
+            return np.zeros(len(df))
+        df2 = df.copy()
+        df2["Fluorescence"] = "Non"
+        pen = (self.gbm.predict(build_features(df, self._month_base))
+               - self.gbm.predict(build_features(df2, self._month_base)))
+        pen[~is_fl.to_numpy()] = 0.0
+        return pen
+
     def _anchored_point(self, df: pd.DataFrame) -> np.ndarray:
         assert self.gbm is not None and self.tables is not None
-        raw = self.gbm.predict(build_features(df))
-        return anchor_predictions(raw, df, self.tables, self._offset, lam=self.cfg.anchor_lambda)
+        raw = self.gbm.predict(build_features(df, self._month_base))
+        fluor_pen = self._model_fluor_penalty(df)   # deepens the market anchor for fluoro
+        if self.cfg.market_led:
+            # Forward pricing: price TO the clean cut+4C-matched market where it
+            # exists (lambda=1, no history offset); the model carries any stone
+            # with no cut-matched market.
+            mkt = market_series(df, self.tables, cut_only=True).to_numpy()
+            out = raw.astype(float).copy()
+            has = ~np.isnan(mkt)
+            out[has] = mkt[has] + fluor_pen[has]
+            return out
+        cal = self._offset if self.cfg.apply_asking_offset else 0.0
+        return anchor_predictions(raw, df, self.tables, cal, lam=self.cfg.anchor_lambda,
+                                  market_extra=fluor_pen)
 
     def _trend_shift(self, df: pd.DataFrame, as_of: pd.Timestamp | None) -> np.ndarray:
         """Damped, capped forward de-bias from the market-trend index.
@@ -211,7 +271,7 @@ class PricingEngine:
         anchored = self._anchored_point(df)
         trend = self._trend_shift(df, as_of)
         fb = self.fallback.predict_detailed(df)
-        mkt = market_series(df, self.tables)
+        mkt = market_series(df, self.tables, cut_only=self.cfg.market_led)
         direction = self.index.as_dict()["direction"] if self.index is not None else "flat"
 
         out: list[PriceSuggestion] = []
@@ -248,11 +308,15 @@ class PricingEngine:
         return out
 
     def _seg_name(self, row: pd.Series) -> str:
-        from ..market.segments import segment_keys
-        for key in segment_keys(row["Shape_full"], row["Weight"], row["Color"], row["Clarity"]):
+        from ..market.segments import cut_graded, is_cut_aware_key, segment_keys
+        keys = segment_keys(row["Shape_full"], row["Weight"], row["Color"], row["Clarity"],
+                            row.get("CPS"))
+        if self.cfg.market_led and cut_graded(row["Shape_full"]):
+            keys = [k for k in keys if is_cut_aware_key(k)]   # cut-matched levels (backoff chain)
+        for key in keys:
             name = "|".join(map(str, key)) if key else "__global__"
             rec = self.tables.segments.get(name)
-            if rec and rec["n"] >= 20:
+            if rec and rec["n"] >= 12:
                 return name
         return "__global__"
 
