@@ -53,7 +53,7 @@ def request(method: str, url: str, **kwargs) -> requests.Response:
     """
     enforce_https(url)
     kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
-    last_exc: Exception | None = None
+    last_info = "unknown error"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.request(method, url, **kwargs)
@@ -62,14 +62,22 @@ def request(method: str, url: str, **kwargs) -> requests.Response:
             resp.raise_for_status()
             return resp
         except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
-            last_exc = e
+            # SANITIZE: a raw requests exception can embed the FULL url — including
+            # path-embedded credentials (Channel Partner puts user/pass in the
+            # path). Keep only the safe status/type; never let the exception (or its
+            # chain) propagate into a log.exception traceback.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            last_info = type(e).__name__ + (f" ({status})" if status else "")
             if attempt == MAX_RETRIES or _is_client_error(e):
                 break
             sleep = BACKOFF_BASE ** attempt
             log.warning("Request to %s failed (%s); retry %d/%d in %.1fs",
                         safe_url(url), type(e).__name__, attempt, MAX_RETRIES, sleep)
             time.sleep(sleep)
-    raise RuntimeError(f"Request to {safe_url(url)} failed after {MAX_RETRIES} attempts") from last_exc
+    # `from None` drops the chained cause so the credential-bearing URL can never
+    # reach a traceback; the message itself is already host+path-only via safe_url.
+    raise RuntimeError(
+        f"Request to {safe_url(url)} failed after {MAX_RETRIES} attempts ({last_info})") from None
 
 
 def _is_client_error(e: Exception) -> bool:

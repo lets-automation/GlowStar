@@ -21,29 +21,63 @@ def size_band(weight: float) -> int:
     return max(0, bisect.bisect_right(SIZE_EDGES, weight) - 1)
 
 
-def size_tag(weight: float) -> str:
-    """A 0.10ct sub-bucket tag within a Rap bracket (e.g. 0.80 -> '#0.80').
+# The client's ROUND price slots (their Master-grid cell boundaries). These are
+# the real, IRREGULAR trade slots — e.g. within 0.30-0.39 the splits are .32/.35
+# but within 0.80-0.89 they are .83/.85 — so a formula won't do; they are listed
+# exactly. A 0.84ct and a 0.85ct round therefore price in DIFFERENT slots, not one
+# lumped 0.80-0.89 bucket. (Client instruction, applied to ROUND pricing.)
+ROUND_SLOTS: tuple[tuple[float, float], ...] = (
+    (0.30, 0.31), (0.32, 0.34), (0.35, 0.39),
+    (0.40, 0.41), (0.42, 0.44), (0.45, 0.49),
+    (0.50, 0.51), (0.52, 0.53), (0.54, 0.59),
+    (0.60, 0.62), (0.63, 0.64), (0.65, 0.69),
+    (0.70, 0.72), (0.73, 0.74), (0.75, 0.79),
+    (0.80, 0.82), (0.83, 0.84), (0.85, 0.89),
+    (0.90, 0.92), (0.93, 0.94), (0.95, 0.99),
+)
+_ROUND_SLOT_LOS = [s[0] for s in ROUND_SLOTS]
 
-    Rap $/ct is flat across a bracket, but DEMAND is not — within 0.70-0.89,
-    0.80ct (near the 0.90 break) lists materially shallower than 0.70ct. A single
-    bracket-level market median lumps these and over-discounts the upper part. The
-    LIVE market is keyed by this finer sub-bucket so a 0.80 stone anchors to
-    0.80-0.89 comps, not the deeper 0.70-0.79 ones. Banked (bracket-level) stays
-    the fallback for thin sub-buckets.
-    """
+
+def round_slot(weight: float) -> tuple[float, float] | None:
+    """The client's round slot [lo, hi] containing `weight`, or None if outside
+    the specified 0.30-0.99 range (falls back to the 0.10ct bucket there)."""
+    w = float(weight)
+    i = bisect.bisect_right(_ROUND_SLOT_LOS, w) - 1
+    if 0 <= i < len(ROUND_SLOTS):
+        lo, hi = ROUND_SLOTS[i]
+        if lo <= w <= hi:
+            return (lo, hi)
+    return None
+
+
+def size_bucket_window(weight: float, shape=None) -> tuple[float, float]:
+    """The size sub-slot [lo, hi] for a stone. For ROUND stones this is the
+    client's exact price slot (e.g. 0.84 -> 0.83-0.84, distinct from 0.85-0.89);
+    otherwise a 0.10ct sub-bucket clamped to the Rap bracket."""
     import math
-    return "#%.2f" % (math.floor(float(weight) / 0.10) * 0.10)
-
-
-def size_bucket_window(weight: float) -> tuple[float, float]:
-    """The [lo, hi] 0.10ct sub-bucket for `weight`, clamped to its Rap bracket."""
-    import math
+    if cut_graded(shape):                       # rounds -> client slots
+        slot = round_slot(weight)
+        if slot is not None:
+            return slot
     b = size_band(weight)
     blo = SIZE_EDGES[b]
     bhi = round(SIZE_EDGES[b + 1] - 0.01, 2) if b + 1 < len(SIZE_EDGES) else round(weight + 1.0, 2)
     lo = max(blo, round(math.floor(float(weight) / 0.10) * 0.10, 2))
     hi = min(bhi, round(lo + 0.0999, 2))
     return lo, hi
+
+
+def size_tag(weight: float, shape=None) -> str:
+    """Sub-slot tag keying the LIVE market segment. For ROUND stones this is the
+    client's price slot (so 0.84 and 0.85 key to DIFFERENT market segments);
+    otherwise a 0.10ct sub-bucket. Banked (bracket-level) is the thin-slot fallback.
+    """
+    import math
+    if cut_graded(shape):
+        slot = round_slot(weight)
+        if slot is not None:
+            return "#%.2f-%.2f" % slot
+    return "#%.2f" % (math.floor(float(weight) / 0.10) * 0.10)
 
 
 # The coarse cut tiers a CPS code maps to (see cut_tier). A segment key is

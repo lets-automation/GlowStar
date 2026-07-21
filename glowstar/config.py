@@ -10,15 +10,21 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Load .env (if present) so credentials and overrides are available process-wide.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:  # python-dotenv optional at import time
-    pass
-
 # Repository root = parent of the `glowstar` package directory.
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Load .env from the REPO ROOT explicitly (not the process cwd). A bare
+# load_dotenv() searches upward from the current working directory, so a
+# scheduler-invoked job (Windows Task / cron) running from C:\Windows\System32
+# or /root would NOT find the repo's .env — credentials would silently read as
+# empty and every live pull would abort. Pinning the path makes the snapshot
+# job authenticate correctly regardless of the working directory it is launched
+# from. Any real environment variables already set still take precedence.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:  # python-dotenv optional at import time
+    pass
 
 # Where immutable snapshots and derived artifacts are written.
 DATA_DIR = REPO_ROOT / "data"
@@ -51,8 +57,10 @@ class Settings:
     """Tunable thresholds. Defaults are conservative; all are explainable."""
 
     # Out-of-time validation split. Train on sales strictly before this date;
-    # test on sales on/after it. ISO date string.
-    backtest_split_date: str = os.environ.get("GS_BACKTEST_SPLIT", "2026-05-01")
+    # test on sales on/after it. Kept RECENT so the test window mirrors production
+    # (nightly retrain -> predict the near term); as live data grows, move this
+    # forward. ISO date string.
+    backtest_split_date: str = os.environ.get("GS_BACKTEST_SPLIT", "2026-06-01")
 
     # A segment with fewer than this many training sales routes to fallback
     # (brief Section 7.6).

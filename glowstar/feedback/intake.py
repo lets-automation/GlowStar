@@ -85,7 +85,11 @@ def ingest_feedback_excel(path: str | Path, *, user: str = "client",
             skipped += 1
             continue
         rap = _to_float(r.get("Rapaport list ($/ct)")) or 0.0
-        sugg_disc = _to_float(r.get("% below Rapaport"))
+        # new column name "Sale discount ..."; fall back to the old "% below Rapaport"
+        # so files sent before the column rename still load.
+        sugg_disc = _to_float(r.get("Sale discount (% below Rap)"))
+        if sugg_disc is None:
+            sugg_disc = _to_float(r.get("% below Rapaport"))
         suggested_discount = -abs(sugg_disc) if sugg_disc is not None else 0.0
 
         human_discount = None
@@ -103,7 +107,8 @@ def ingest_feedback_excel(path: str | Path, *, user: str = "client",
         rec = FeedbackRecord(
             stone_id=str(r.get("Stone ID") or ""), decision=decision,
             suggested_discount=suggested_discount,
-            suggested_net=_to_float(r.get("Suggested total ($)")) or 0.0,
+            suggested_net=(_to_float(r.get("Sale total ($)"))
+                           or _to_float(r.get("Suggested total ($)")) or 0.0),
             shape_full=str(r.get("Shape") or "NA"), weight=_to_float(r.get("Weight (ct)")) or 0.0,
             color=str(r.get("Colour") or "NA"), clarity=str(r.get("Clarity") or "NA"),
             cps=str(r.get("Cut") or "NA"), fluorescence=str(r.get("Fluorescence") or "Non"),
@@ -118,4 +123,137 @@ def ingest_feedback_excel(path: str | Path, *, user: str = "client",
 
     summary = {"recorded": recorded, "skipped_no_decision": skipped, "errors": errors}
     log.info("Feedback intake from %s: %s", path, summary)
+    return summary
+
+
+def _discount(v) -> float | None:
+    """Normalise a workbook's ``% below Rap`` value to the engine's sign.
+
+    Client comparison files commonly show their chosen discount as a negative
+    number while the generated report shows it as a positive magnitude.  The
+    feedback store always uses the engine convention: a discount below Rap is
+    negative.
+    """
+    value = _to_float(v)
+    return None if value is None else -abs(value)
+
+
+def ingest_client_diff_excel(path: str | Path, *, user: str = "client",
+                             store_path: Path | None = None,
+                             accepted_tolerance: float = 2.0,
+                             max_auto_override_variance: float = 15.0) -> dict:
+    """Import a client comparison workbook such as ``GS DIFF.xlsx``.
+
+    Unlike a standard returned GlowStar report, this workbook groups stones
+    into tabs and supplies the desk's chosen discount in a ``glow price``
+    column.  Its named triage tabs are authoritative (``less than`` accepts;
+    ``2-`` and ``more than`` become gold overrides).  For an unrecognised tab,
+    ``accepted_tolerance`` provides the same numeric fallback. A very large
+    difference is not silently learned: it is quarantined because it is usually
+    a sold-out stone, a non-price status, or a data-entry error.
+
+    The returned audit summary deliberately includes every quarantine so the
+    caller can resolve it before it influences a future retrain.
+    """
+    if accepted_tolerance < 0 or max_auto_override_variance <= accepted_tolerance:
+        raise ValueError("Override variance threshold must be greater than the accepted tolerance.")
+
+    sheets = pd.read_excel(path, sheet_name=None)
+    recorded = accepted = overrides = 0
+    rows_seen = 0
+    quarantined: list[dict] = []
+    errors: list[str] = []
+    usable_sheet_found = False
+
+    for sheet_name, df in sheets.items():
+        df.columns = [str(c).strip() for c in df.columns]
+        required = {"Stone ID", "Shape", "Weight (ct)", "Colour", "Clarity",
+                    "Rapaport list ($/ct)", "Sale discount (% below Rap)", "glow price"}
+        if not required.issubset(df.columns):
+            continue
+        usable_sheet_found = True
+        # The client has already triaged the sheets. Preserve that decision:
+        # values displayed as exactly 2.0/5.0 can otherwise slip into the wrong
+        # bucket because of Excel rounding or a boundary convention mismatch.
+        sheet_key = str(sheet_name).strip().casefold()
+        if "less than" in sheet_key:
+            review_bucket = False
+        elif "2-" in sheet_key or "more than" in sheet_key:
+            review_bucket = True
+        else:
+            review_bucket = None
+
+        for _, r in df.iterrows():
+            rows_seen += 1
+            stone_id = _clean_str(r.get("Stone ID"))
+            suggested_discount = _discount(r.get("Sale discount (% below Rap)"))
+            client_discount = _discount(r.get("glow price"))
+            rap = _to_float(r.get("Rapaport list ($/ct)")) or 0.0
+            if not stone_id or suggested_discount is None or client_discount is None or rap <= 0:
+                errors.append(f"{sheet_name}: invalid pricing row for {stone_id or 'unknown stone'}")
+                continue
+
+            variance = abs(client_discount - suggested_discount)
+            if variance > max_auto_override_variance:
+                quarantined.append({
+                    "stone_id": stone_id,
+                    "sheet": sheet_name,
+                    "suggested_discount": suggested_discount,
+                    "client_discount": client_discount,
+                    "variance": round(variance, 2),
+                    "reason": "variance exceeds automatic-learning guard",
+                })
+                continue
+
+            is_within_tolerance = (not review_bucket if review_bucket is not None
+                                    else variance <= accepted_tolerance)
+            if is_within_tolerance:
+                decision = Decision.ACCEPT.value
+                reason = None
+                accepted += 1
+                human_discount = None
+            else:
+                decision = Decision.OVERRIDE.value
+                # A deeper client discount means our price was too high; a
+                # shallower one means our discount was too deep.
+                reason = (ReasonCode.DISCOUNT_TOO_SHALLOW.value
+                          if client_discount < suggested_discount
+                          else ReasonCode.DISCOUNT_TOO_DEEP.value)
+                overrides += 1
+                human_discount = client_discount
+
+            rec = FeedbackRecord(
+                stone_id=stone_id, decision=decision,
+                suggested_discount=suggested_discount,
+                suggested_net=_to_float(r.get("Sale total ($)")) or 0.0,
+                shape_full=_clean_str(r.get("Shape")) or "NA",
+                weight=_to_float(r.get("Weight (ct)")) or 0.0,
+                color=_clean_str(r.get("Colour")) or "NA",
+                clarity=_clean_str(r.get("Clarity")) or "NA",
+                cps=_clean_str(r.get("Cut")) or "NA",
+                fluorescence=_clean_str(r.get("Fluorescence")) or "Non",
+                lab=_clean_str(r.get("Lab")) or "GIA", rap=rap,
+                reason_code=reason,
+                note=(f"Imported from {Path(path).name}; sheet={sheet_name}; "
+                      f"client_discount={client_discount:.2f}; variance={variance:.2f}"),
+                human_discount=human_discount, user=user,
+            )
+            try:
+                record(rec, path=store_path)
+                recorded += 1
+            except ValueError as e:
+                errors.append(f"{stone_id}: {e}")
+
+    if not usable_sheet_found:
+        raise ValueError("No GS comparison sheet found with the required price columns.")
+
+    summary = {
+        "rows_seen": rows_seen,
+        "recorded": recorded,
+        "accepted_within_tolerance": accepted,
+        "overrides_for_learning": overrides,
+        "quarantined": quarantined,
+        "errors": errors,
+    }
+    log.info("Client comparison intake from %s: %s", path, summary)
     return summary

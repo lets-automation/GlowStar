@@ -21,10 +21,12 @@ import numpy as np
 
 @pytest.fixture(scope="module")
 def trained():
+    from glowstar.config import SETTINGS
     df, _ = load_records()
     sold = sold_stones(df, drop_outliers=True)
-    train, test, _ = time_split(sold, "2026-05-01")
-    eng = PricingEngine(EngineConfig(split_date="2026-05-01")).fit(train)
+    split = SETTINGS.backtest_split_date
+    train, test, _ = time_split(sold, split)
+    eng = PricingEngine(EngineConfig(split_date=split)).fit(train)
     return eng, test
 
 
@@ -55,27 +57,81 @@ def test_engine_beats_baseline_threshold(trained):
     sugg = eng.predict(test)
     pred = np.array([s.suggested_discount for s in sugg])
     mae = M.compute(pred, test).mae
-    assert mae < 4.5           # engine measured ~3.6 (tuned); baseline ~7.4 — locks in the gain
+    # Production-representative split (recent test window, +BGM +size-tier +competence
+    # guard) measures MAE ~3.88 out-of-time (baseline ~7.2). Threshold locks in the
+    # ~46% gain and catches a silent regression; 4.1 leaves a small margin.
+    assert mae < 4.1
     assert not math.isnan(mae)
 
 
-def test_bgm_unassessed_flag_when_no_bgm_data(trained):
-    """records.json has no BGM fields -> every stone priced on the clean base
-    must be flagged bgm_unassessed (client request: surface the assumption)."""
+def test_competence_guard_defers_weak_shapes(trained):
+    """A shape the model+anchor loses to the segment median on (measured out-of-time)
+    must route to the baseline and carry a human-review flag, not be auto-priced.
+    On this data Sq.Emerald is the clear structural loser (model MAE ~8 vs median
+    ~2); it must be deferred, and any deferred shape must use the fallback path."""
     eng, test = trained
-    sugg = eng.predict(test.head(50))
-    assert all(s.assumes_no_bgm for s in sugg)
-    assert all("bgm_unassessed" in s.flags for s in sugg)
+    # The guard fired (data-driven, not hardcoded) and picked the known weak shape.
+    assert "Sq. Emerald" in eng._defer_shapes
+    weak = test[test["Shape_full"].isin(eng._defer_shapes)]
+    if len(weak):
+        sugg = eng.predict(weak.head(20))
+        assert all(s.method == "fallback" and "segment_review" in s.flags for s in sugg)
+    # Shapes the model wins on must NOT be deferred (no over-routing to the median).
+    assert "Round" not in eng._defer_shapes
+
+
+def test_bgm_assessed_from_inventory(trained):
+    """The client's live BgmComments is now in the data -> stones are ASSESSED
+    (clean / bgm), not 'unassessed'. Clean (No Brown, No Milky) stones price on the
+    clean base with assumes_no_bgm=False; milky/brown stones are 'bgm'; only stones
+    with NO BGM data at all fall back to 'unassessed'."""
+    eng, test = trained
+    clean = test[(test["milky_ord"] == 0) & (test["brown_ord"] == 0)]
+    if len(clean):
+        s = eng.predict(clean.head(30))
+        assert all(not x.assumes_no_bgm for x in s)
+        assert all("bgm_unassessed" not in x.flags for x in s)
+        assert all(x.bgm_state == "clean" for x in s)
+    bgm = test[test["milky_ord"] > 0]
+    if len(bgm):
+        assert all(x.bgm_state == "bgm" for x in eng.predict(bgm.head(10)))
+    unknown = test[test["milky_ord"].isna() & test["brown_ord"].isna()]
+    if len(unknown):
+        s = eng.predict(unknown.head(10))
+        assert all(x.assumes_no_bgm for x in s)
+        assert all("bgm_unassessed" in x.flags for x in s)
 
 
 def test_online_feedback_correction_shifts_price(trained):
-    """A per-segment override correction must immediately move suggestions."""
+    """A SPECIFIC (>=3-level) override correction must immediately move
+    suggestions. Broad shape-only/global feedback is deliberately ignored
+    online (see test_broad_feedback_correction_is_ignored) so one unrepresentative
+    returned batch cannot drag every stone of that shape."""
     eng, test = trained
     row = test.iloc[[0]]
+    r = row.iloc[0]
     before = eng.predict(row)[0].suggested_discount
-    seg = f"{row.iloc[0]['Shape_full']}"
+    # a supported, sufficiently-specific cell: shape|weight-decade|colour
+    from glowstar.market.segments import segment_keys
+    key = next(k for k in segment_keys(r["Shape_full"], r["Weight"], r["Color"],
+                                       r["Clarity"], r.get("CPS")) if len(k) == 3)
+    seg = "|".join(map(str, key))
     eng.set_corrections({seg: {"offset": 5.0, "n": 9}})
     after = eng.predict(row)[0]
     assert abs((after.suggested_discount - before) - 5.0) < 1e-6
     assert after.feedback_correction_pts == 5.0
     eng.set_corrections({})        # reset so other tests are unaffected
+
+
+def test_broad_feedback_correction_is_ignored(trained):
+    """A shape-only correction must NOT move prices: a single returned batch is
+    often directionally unrepresentative, and a broad offset would drag stones in
+    unrelated price cells. Measured: applying broad offsets cost +0.61 MAE."""
+    eng, test = trained
+    row = test.iloc[[0]]
+    before = eng.predict(row)[0].suggested_discount
+    eng.set_corrections({str(row.iloc[0]["Shape_full"]): {"offset": 5.0, "n": 9}})
+    after = eng.predict(row)[0]
+    assert after.suggested_discount == before
+    assert after.feedback_correction_pts == 0.0
+    eng.set_corrections({})

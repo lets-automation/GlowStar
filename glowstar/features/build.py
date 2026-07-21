@@ -17,6 +17,7 @@ matrix leaves clean slots (`SOFT_FEATURES`) for them to be joined in later
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,7 +28,47 @@ from ..reference.normalize import CLARITY_ORDER
 
 TARGET = "FDiscount"
 
+# Tinge severity ordinals from the client's live STRUCTURED inventory fields
+# (Brown/Milky/Shade/Green — added to the API 2026-07). Physical inspection
+# attributes known at listing time (legitimate features, not leakage).
+# shade_ord/green_ord are NEW: the legacy `BgmComments` text carried only brown and
+# milky, so tint and green were invisible. Measured: adding them cut error on
+# TINGED stones 3.93 -> 3.41 MAE while leaving clean stones flat.
+# Toggle with GS_USE_BGM=0 for the on/off ablation.
+BGM_FEATURES: tuple[str, ...] = ("milky_ord", "brown_ord", "shade_ord", "green_ord")
+_USE_BGM: bool = os.environ.get("GS_USE_BGM", "1") != "0"
+
+# Sentinel for "this stone was never assessed for this tinge". Distinct from 0.0
+# (= assessed and confirmed absent) — conflating the two is what silently
+# over-prices a tinged stone. Negative so it sorts below every real severity.
+UNASSESSED: float = -1.0
+
+# The client's own Master-grid reading for this stone's cell, AS OF the pricing
+# date (never today's value for a past sale — that is leakage; see
+# market/grid_history.py). Supplied ONLY to the grid-routed model, which is fit
+# exclusively on rows that have a cell, so the column is never all-missing.
+#
+# It is a FEATURE, never an anchor. Measured point-in-time: the grid ALONE scores
+# MAE 4.13 vs the engine's 2.26, and the best engine/grid BLEND weight is ZERO —
+# CLAUDE.md's "never copy the grid" is correct. But as a feature the model learns
+# when the cell is informative, worth -0.27..-0.63 MAE across four out-of-time
+# splits and ~40% off the >=5pt tail.
+GRID_FEATURES: tuple[str, ...] = ("grid_discount", "grid_age_days")
+
 # Categorical features (native categorical handling in HistGradientBoosting).
+#
+# Color and Clarity appear BOTH here and as `color_ordinal`/`clarity_ordinal`. That
+# is intentional, not an oversight: the ordinal carries the order, the categorical
+# lets the tree learn per-grade deviations that the order does not explain — and
+# those deviations are REAL. The discount is measured off Rap, which already prices
+# colour/clarity, so the residual discount surface is genuinely non-monotone (47.7%
+# of adjacent colour pairs in the client's own sales have the worse colour at a
+# shallower discount; F/G/H are commercial goods that trade shallower off Rap).
+#
+# Removing the categorical twin to "fix" apparent inversions was tried and reverted:
+# it enables a monotonic constraint that enforces a rule the client's market breaks
+# half the time, and it cost MAE (3.158 -> 3.166) for a defect that was not real.
+# See models/gbm.py MONOTONIC.
 CATEGORICAL_FEATURES: tuple[str, ...] = (
     "Shape_full", "Color", "Clarity", "CPS", "Fluorescence", "Lab", "Location",
 )
@@ -122,11 +163,30 @@ def _market_month_index(df: pd.DataFrame, base: pd.Timestamp | None = None) -> p
     return ((d - base).dt.days / 30.44).astype("float64")
 
 
-def build_features(df: pd.DataFrame, month_base: pd.Timestamp | None = None) -> pd.DataFrame:
+def _numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
+    """`df[col]` as numeric, or an all-NaN Series when the column is absent.
+
+    Always a Series, never a bare float: an external stone file legitimately lacks
+    columns the training frame has (a GIA export carries no shade/green), and
+    `pd.to_numeric(np.nan)` returns a scalar, which then fails on .fillna and takes
+    the whole price run down.
+    """
+    if col not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def build_features(df: pd.DataFrame, month_base: pd.Timestamp | None = None,
+                   with_grid: bool = False) -> pd.DataFrame:
     """Return the model feature matrix X (no target, no forbidden columns).
 
     `month_base` freezes the `market_month_index` origin to the training epoch so
     train/test/serve all share one time scale (see `_market_month_index`).
+
+    `with_grid` adds the point-in-time Master-grid columns (see GRID_FEATURES).
+    It is an EXPLICIT flag, not "include if the column happens to be present": the
+    engine fits one model per schema and routes per stone, so train and serve must
+    never disagree about which matrix they are on.
     """
     x = pd.DataFrame(index=df.index)
 
@@ -140,6 +200,25 @@ def build_features(df: pd.DataFrame, month_base: pd.Timestamp | None = None) -> 
     x["bracket_index"] = np.digitize(df["Weight"].to_numpy(), _BRACKET_EDGES).astype("float64")
     x["is_round"] = (df["Shape_full"].str.strip().str.lower() == "round").astype("float64")
     x["market_month_index"] = _market_month_index(df, month_base)
+
+    # Tinge severity (client's live structured Brown/Milky/Shade/Green fields).
+    # "Unassessed" is encoded as the explicit sentinel UNASSESSED (-1.0), NOT NaN:
+    #   * an all-NaN column CRASHES HistGradientBoosting at fit ("window shape
+    #     cannot be larger than input array shape"), so a feed that stopped sending
+    #     Shade/Green would take the nightly retrain down;
+    #   * the sentinel keeps the matrix schema fixed and train/serve consistent, and
+    #     makes "not assessed" a value the tree can split on — which is the honest
+    #     encoding, since unassessed is NOT the same as assessed-clean (0.0).
+    if _USE_BGM:
+        for col in BGM_FEATURES:
+            x[col] = _numeric_col(df, col).fillna(UNASSESSED).astype("float64")
+
+    # The client's own grid reading for this cell, as of the pricing date. Only for
+    # the grid-routed model — which is fit solely on rows that HAVE a cell, so this
+    # is never all-missing (an all-NaN column hard-crashes HistGradientBoosting).
+    if with_grid:
+        for col in GRID_FEATURES:
+            x[col] = _numeric_col(df, col).astype("float64")
 
     # Categorical (pandas 'category' dtype -> native GBM handling, robust to
     # unseen/rare levels). CPS is first clamped to the training vocabulary so an
@@ -162,7 +241,8 @@ def get_target(df: pd.DataFrame) -> pd.Series:
 # column — a transaction leak, a typo, or a future careless edit — trips the
 # guard, instead of relying on the matrix never being built from raw df columns.
 _ALLOWED_FEATURES: frozenset[str] = frozenset(
-    NUMERIC_FEATURES + CATEGORICAL_FEATURES + SOFT_FEATURES
+    NUMERIC_FEATURES + CATEGORICAL_FEATURES + SOFT_FEATURES + BGM_FEATURES
+    + GRID_FEATURES
 )
 
 

@@ -19,9 +19,24 @@ CRM: it turns `unassessed` into `clean`/`bgm` and removes the assumption risk.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .aggregate_bulk import _milky_severity, _shade_class
+
+_MILKY_NAME = {0: "none", 1: "light", 2: "medium", 3: "heavy"}
+_BROWN_NAME = {0: "none", 1: "light", 2: "medium", 3: "heavy"}
+
+
+def _ord(v) -> int | None:
+    """A BGM ordinal as int, or None if missing/NaN."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else int(round(f))
 
 
 @dataclass
@@ -37,9 +52,21 @@ class BgmAssessment:
         return self.__dict__
 
 
+def _present(v) -> bool:
+    """True if `v` carries an actual assessment. NaN counts as ABSENT — it is what a
+    missing cell reads as once the stone comes from a DataFrame, and `not in (None,
+    "")` lets it through (NaN is truthy), which then misreports an unassessed stone
+    as assessed and, downstream, crashed on .strip()."""
+    if v is None:
+        return False
+    if isinstance(v, float) and v != v:
+        return False
+    return str(v).strip().lower() not in ("", "nan", "none")
+
+
 def _has_bgm_fields(stone: dict) -> bool:
-    return any(stone.get(k) not in (None, "") for k in ("milky", "Milky", "shade",
-                                                        "Shade", "shade_name", "is_bgm"))
+    return any(_present(stone.get(k)) for k in ("milky", "Milky", "shade",
+                                                "Shade", "shade_name", "is_bgm"))
 
 
 def assess(stone: dict, tables) -> BgmAssessment:
@@ -47,6 +74,26 @@ def assess(stone: dict, tables) -> BgmAssessment:
 
     `tables` is a MarketTables (exposes soft_delta learned from market data).
     """
+    # Preferred path: the client's live BgmComments, parsed to ordinals by the
+    # loader. BGM is now a MODEL feature (learned from their own realized sales),
+    # so we report the assessed STATE but apply NO post-model deduction here
+    # (that would double-count what the model already prices).
+    milky_o, brown_o = _ord(stone.get("milky_ord")), _ord(stone.get("brown_ord"))
+    if milky_o is not None or brown_o is not None:
+        m, b = milky_o or 0, brown_o or 0
+        if m == 0 and b == 0:
+            return BgmAssessment(
+                state="clean", milky_severity="none", shade_class="none",
+                deduction_pts=0.0, assumes_no_bgm=False,
+                note="Assessed No-BGM (No Brown, No Milky) from your inventory — priced at the clean base.")
+        return BgmAssessment(
+            state="bgm", milky_severity=_MILKY_NAME.get(m, "?"),
+            shade_class=("brown" if b > 0 else "none"), deduction_pts=0.0,
+            assumes_no_bgm=False,
+            note=f"BGM assessed from your inventory (milky={_MILKY_NAME.get(m,'?')}, "
+                 f"brown={_BROWN_NAME.get(b,'?')}); priced by the model, which learned the "
+                 "milky/brown discount from your own realized sales.")
+
     if not _has_bgm_fields(stone):
         return BgmAssessment(
             state="unassessed", milky_severity="unknown", shade_class="unknown",

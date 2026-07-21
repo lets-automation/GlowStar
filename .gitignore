@@ -13,6 +13,14 @@ __pycache__/
 artifacts/
 data/snapshots/
 
+# Banked Master grid: the live sheet (current.json) and the POINT-IN-TIME edit
+# history the grid model trains on. Large (~100MB+) and machine-local, so not in
+# git — but history.json is NOT reproducible from a later pull: it is what a cell
+# read on the day a stone was priced. Losing it means the grid model cannot be
+# honestly validated (today's grid explaining a past sale is leakage). BACK IT UP;
+# rebuild only via `glowstar.market.grid_history.bank_history(days=N)`.
+data/master_grid/
+
 # Large reference dumps (provided out-of-band, never committed)
 UNI_BGMFILEDWITH.json
 response.json

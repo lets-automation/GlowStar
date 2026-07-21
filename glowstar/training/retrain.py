@@ -20,12 +20,12 @@ in the README. Run once:  python -m glowstar.training.retrain
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 import numpy as np
 
 from ..config import SETTINGS
-from ..data.history import assemble_sold_history
 from ..feedback import store as fbstore
 from ..models.engine import PricingEngine, EngineConfig
 from ..models import registry
@@ -52,7 +52,39 @@ def gate_decision(cand_mae: float | None, inc_mae: float | None,
     return False, f"candidate MAE {cand_mae} worse than incumbent {inc_mae} + tol {tolerance}"
 
 
+def serving_config(split_date: str | None = None) -> EngineConfig:
+    """THE config. Training, gating and serving must all use this one object.
+
+    This exists because they did not. `price_and_report` shipped market_led=True
+    while the gate, `glowstar.status` and every backtest built a bare
+    EngineConfig() (market_led=False) — so the accuracy we measured and published
+    was from a pipeline the client never received. On the same held-out stones the
+    shipped path scored MAE 7.48 / bias +6.10 against the measured 3.84 / +0.85.
+    A gate that scores a different config than it promotes is not a gate.
+
+    Anything that prices a stone for real must construct its config HERE.
+    """
+    return EngineConfig(split_date=split_date or SETTINGS.backtest_split_date)
+
+
+def _assert_gate_scores_what_ships(engine: PricingEngine) -> None:
+    """Fail loudly if the gated engine is not on the serving config.
+
+    A silent divergence here is what let an unmeasured pricing path reach the desk
+    for weeks, so it is an assertion, not a log line.
+    """
+    ref = serving_config(engine.cfg.split_date)
+    for field in ("market_led", "anchor_lambda", "apply_asking_offset", "use_trend"):
+        got, want = getattr(engine.cfg, field), getattr(ref, field)
+        if got != want:
+            raise AssertionError(
+                f"Promotion gate is scoring {field}={got!r} but serving uses {want!r}. "
+                "The gate must score the config that ships (see serving_config)."
+            )
+
+
 def _evaluate(engine: PricingEngine, test) -> dict:
+    _assert_gate_scores_what_ships(engine)
     sugg = engine.predict(test)
     pred = np.array([s.suggested_discount for s in sugg])
     lo = np.array([s.ci_discount_low for s in sugg])
@@ -72,21 +104,40 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
     """Run one retrain cycle. Returns a summary dict (also logged)."""
     split_date = split_date or SETTINGS.backtest_split_date
 
-    # 1. Bank a fresh snapshot if we can (side effect: grows the history).
+    # 1. Rebuild records.json FRESH from the live API (current stock + latest sales
+    #    + live BGM), unioned onto the deep-history base — so the model is never
+    #    trained on a stale file (client rule: everything live).
     if prefer_live:
         try:
-            from ..pipeline import ingest_records
-            ingest_records(prefer_live=True)
+            from ..data.history import rebuild_records_from_live
+            rebuild_records_from_live()
         except Exception:
-            log.exception("Live pull failed; retraining on existing snapshots/file.")
+            log.exception("Live rebuild failed; retraining on the existing records.json.")
 
-    # 2. Assemble the union of sold history across all banked snapshots.
-    sold = assemble_sold_history()
-    feedback = fbstore.load_all()
+    # 2. Train on the (freshly rebuilt) full sold history.
+    from ..data.loaders import load_records, sold_stones
+    sold = sold_stones(load_records()[0], drop_outliers=True)
+
+    # Human feedback is OFF by default and must stay off until it is calibrated.
+    # Measured (23k sold, 122 desk records): enabling it costs +0.93 MAE
+    # (3.92 -> 4.85) -- online per-segment corrections +0.61, feedback training
+    # labels +0.32. The desk's returned 'glow price' is an ASKING QUOTE, not a
+    # realized sale, so training a sale-price model on it teaches the wrong
+    # target; and build_corrections(min_support=3) shifts a whole price cell off
+    # 3 stones. Left on, the promotion gate rejects every candidate and the
+    # nightly retrain silently freezes. Re-enable with GS_USE_FEEDBACK=1 only
+    # after raising min_support (~8-10), shrinking the offsets, and scoring BOTH
+    # realized-sale MAE and variance-vs-desk-quote.
+    use_fb = os.environ.get("GS_USE_FEEDBACK", "0") != "0"
+    feedback = fbstore.load_all() if use_fb else []
+    if not use_fb:
+        log.info("Feedback DISABLED for training (GS_USE_FEEDBACK=0); "
+                 "%d records on disk are recorded but not learned.",
+                 len(fbstore.load_all()))
 
     # 3. Candidate evaluated out-of-time (honest, leakage-free).
     train, test, info = time_split(sold, split_date)
-    cand_eval = PricingEngine(EngineConfig(split_date=split_date)).fit(
+    cand_eval = PricingEngine(serving_config(split_date)).fit(
         train, feedback_records=feedback)
     metrics = _evaluate(cand_eval, test) if len(test) else {
         "mae": None, "within5": None, "coverage": None, "bias": None}
@@ -97,7 +148,7 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
     promote, reason = gate_decision(metrics["mae"], inc_mae, tolerance)
 
     # 5. Save a PRODUCTION engine (trained on ALL sold + feedback); promote if gated.
-    prod = PricingEngine(EngineConfig(split_date=split_date)).fit(
+    prod = PricingEngine(serving_config(split_date)).fit(
         sold, feedback_records=feedback)
     version = datetime.now().strftime("%Y%m%dT%H%M%S")
     card = registry.ModelCard(

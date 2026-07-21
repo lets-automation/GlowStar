@@ -6,7 +6,7 @@ import json
 import pandas as pd
 import pytest
 
-from glowstar.feedback.intake import ingest_feedback_excel
+from glowstar.feedback.intake import ingest_client_diff_excel, ingest_feedback_excel
 from glowstar.feedback.store import Decision, ReasonCode
 
 
@@ -77,3 +77,45 @@ def test_rejects_non_glowstar_file(tmp_path):
         pd.DataFrame([{"foo": 1}]).to_excel(xl, sheet_name="Suggested Prices", index=False)
     with pytest.raises(ValueError):
         ingest_feedback_excel(wb)
+
+
+def test_ingest_client_diff_turns_variances_into_audited_feedback(tmp_path):
+    wb = tmp_path / "GS DIFF.xlsx"
+    store = tmp_path / "decisions.jsonl"
+    accepted_row = [
+        # Within two points: confirms the existing suggestion.
+        {"Stone ID": "A", "Shape": "Round", "Weight (ct)": 1.0, "Colour": "G",
+         "Clarity": "VS1", "Cut": "EX", "Fluorescence": "None", "Lab": "GIA",
+         "Rapaport list ($/ct)": 10000, "Sale discount (% below Rap)": 50,
+         "glow price": -51.5, "Sale total ($)": 5000},
+    ]
+    override_row = [
+        # The review tab is authoritative even at an exact two-point boundary.
+        {"Stone ID": "B", "Shape": "Round", "Weight (ct)": 1.0, "Colour": "G",
+         "Clarity": "VS1", "Cut": "EX", "Fluorescence": "None", "Lab": "GIA",
+         "Rapaport list ($/ct)": 10000, "Sale discount (% below Rap)": 50,
+         "glow price": -52, "Sale total ($)": 5000},
+    ]
+    quarantined_row = [
+        # A sold-out/status-like value must not poison learning.
+        {"Stone ID": "C", "Shape": "Round", "Weight (ct)": 1.0, "Colour": "G",
+         "Clarity": "VS1", "Cut": "EX", "Fluorescence": "None", "Lab": "GIA",
+         "Rapaport list ($/ct)": 10000, "Sale discount (% below Rap)": 50,
+         "glow price": -7, "Sale total ($)": 5000},
+    ]
+    with pd.ExcelWriter(wb, engine="openpyxl") as xl:
+        pd.DataFrame(accepted_row).to_excel(xl, sheet_name="less than 2", index=False)
+        pd.DataFrame(override_row).to_excel(xl, sheet_name="2-4.99", index=False)
+        pd.DataFrame(quarantined_row).to_excel(xl, sheet_name="more than 5", index=False)
+
+    summary = ingest_client_diff_excel(wb, store_path=store)
+    assert summary["rows_seen"] == 3
+    assert summary["recorded"] == 2
+    assert summary["accepted_within_tolerance"] == 1
+    assert summary["overrides_for_learning"] == 1
+    assert summary["quarantined"][0]["stone_id"] == "C"
+
+    recs = [json.loads(l) for l in store.read_text(encoding="utf-8").splitlines()]
+    override = next(r for r in recs if r["stone_id"] == "B")
+    assert override["human_discount"] == -52.0
+    assert override["reason_code"] == ReasonCode.DISCOUNT_TOO_SHALLOW.value
