@@ -55,14 +55,28 @@ def _median_from_hist(hist: dict[int, int]) -> tuple[float, int]:
     return float("nan"), n
 
 
-def _shade_class(shade: str) -> str:
+def _clean_text(v) -> str:
+    """Lower-cased text from any source value; '' for absent.
+
+    Tolerates float NaN, which is what a MISSING cell reads as once these fields
+    come from a DataFrame rather than raw JSON. `(v or "")` does NOT handle it —
+    NaN is truthy, so it slips through and blows up on .strip().
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float) and v != v:          # NaN
+        return ""
+    return str(v).strip().lower()
+
+
+def _shade_class(shade) -> str:
     """Bucket the raw shade into value-negative / neutral / positive.
 
     Brown/Green/Gray (and faint variants) and Mix are value-negative true BGM
     shades. Yellow is the normal graded-color axis (neutral here). Pink and
     other fancy hues are value-positive. None/Not Reported -> none.
     """
-    s = (shade or "").strip().lower()
+    s = _clean_text(shade)
     if not s or s in ("none", "not reported", "-"):
         return "none"
     if any(t in s for t in ("brown", "green", "gray", "grey", "mix")):
@@ -72,8 +86,8 @@ def _shade_class(shade: str) -> str:
     return "neutral"  # e.g. yellow / unclassified
 
 
-def _milky_severity(milky: str) -> str:
-    m = (milky or "").strip().lower()
+def _milky_severity(milky) -> str:
+    m = _clean_text(milky)
     if not m or m in ("no milky", "not reported", "none"):
         return "none"
     if "heavy" in m:

@@ -95,21 +95,32 @@ def grid_for_shape(shape_code: str | None, shape_full: str | None) -> RapGrid:
 # --- Fluorescence ----------------------------------------------------------
 
 # records.json uses abbreviations; canonicalize to intensity buckets.
+#
+# MUST BE IDEMPOTENT: every canonical OUTPUT is also a key. It was not, and the gap
+# was silent — "VERY STRONG" and "VERY SLIGHT" were absent, so
+# normalize_fluorescence("Very Strong") returned "Unknown" while
+# normalize_fluorescence("Vstg") returned "Very Strong". Any caller handed an
+# already-normalised value (or the client's long-form spelling) would drop the
+# stone into "Unknown" and quietly lose its fluorescence — on exactly the tier
+# where fluorescence matters most.
 FLUOR_CANON: dict[str, str] = {
     "NON": "None", "NONE": "None",
     "FNT": "Faint", "FAINT": "Faint",
-    "VSL": "Very Slight", "VSLT": "Very Slight",
+    "VSL": "Very Slight", "VSLT": "Very Slight", "VERY SLIGHT": "Very Slight",
     "SLT": "Slight", "SLIGHT": "Slight",
     "MED": "Medium", "MEDIUM": "Medium",
     "STG": "Strong", "STRONG": "Strong",
-    "VSTG": "Very Strong", "VSTRONG": "Very Strong",
+    "VSTG": "Very Strong", "VSTRONG": "Very Strong", "VERY STRONG": "Very Strong",
     # Uni feed single-letter intensities:
     "N": "None", "F": "Faint", "M": "Medium", "S": "Strong", "VS": "Very Strong",
 }
 
 
 def normalize_fluorescence(raw: str | None) -> str:
-    """Canonical fluorescence intensity, or 'Unknown' if missing/unmapped."""
+    """Canonical fluorescence intensity, or 'Unknown' if missing/unmapped.
+
+    Idempotent: normalize(normalize(x)) == normalize(x) — see FLUOR_CANON.
+    """
     if raw is None:
         return "Unknown"
-    return FLUOR_CANON.get(raw.strip().upper(), "Unknown")
+    return FLUOR_CANON.get(str(raw).strip().upper(), "Unknown")

@@ -61,10 +61,19 @@ def _is_broad_market(s) -> bool:
 def _confidence(s) -> str:
     """High / Medium / Low from market support and routing (the real discriminators).
 
-    Low  = sparse-data fallback, rare shape, fancy colour, or a thin market.
+    Low  = sparse-data fallback, rare shape, fancy colour, thin market, or an
+           attribute we have explicitly told the desk we cannot price (see below).
     High = a TIGHT market match (real comparables) with a normal band.
     Medium = everything else, including a broad/whole-market fallback (no tight match).
     """
+    # A stone we are ASKING the desk to price cannot also be "High confidence".
+    # These flags print a note saying we under-price this attribute and they should
+    # set it themselves; pairing that with "High" is self-contradictory and the desk
+    # reads it — correctly — as us not knowing what we know. Both are real: strong
+    # fluoro on near-colourless runs +1.5..+2.2 pts shallow out-of-time, and severe
+    # milky/brown is under-discounted for want of examples.
+    if "fluor_review" in s.flags or "bgm_review" in s.flags:
+        return "Low"
     if (s.method == "fallback" or "rare_shape" in s.flags
             or "fancy_color" in s.flags or "thin_market" in s.flags):
         return "Low"
@@ -83,9 +92,18 @@ def _note(s) -> str:
     if s.bgm_state == "unassessed":
         notes.append("Assumes no Brown/Green/Milky tinge (not recorded for this stone)")
     elif s.bgm_state == "bgm":
-        notes.append(f"Adjusted down for Brown/Green/Milky tinge ({abs(s.bgm_deduction_pts):.0f}% extra)")
+        # BGM is now priced by the MODEL (learned from the client's own sales), not
+        # a fixed post-model deduction — so don't report the (zeroed) deduction.
+        notes.append("Brown/Green/Milky recorded — priced deeper than a clean stone")
     elif s.bgm_state == "clean":
         notes.append("Confirmed clean (no Brown/Green/Milky)")
+    if "bgm_review" in s.flags:
+        notes.append("Medium/Heavy tinge — please review the discount yourself "
+                     "(the model under-prices severe Brown/Milky)")
+    if "fluor_review" in s.flags:
+        notes.append("Strong fluorescence on a near-colourless stone — please set "
+                     "this discount yourself (we have too few such sales to price it "
+                     "reliably, and we tend to price it too high)")
     if "rare_shape" in s.flags:
         notes.append("Rare shape — please review")
     if "fancy_color" in s.flags:

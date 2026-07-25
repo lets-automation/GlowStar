@@ -44,9 +44,27 @@ def fluorescence_code(raw: str | None) -> int | None:
     return CONFIRMED.get("fluorescence", {}).get(letter) if letter else None
 
 
+def _demand_decade(weight: float) -> tuple[float, float]:
+    """The 0.10ct size 'decade' a stone sits in (e.g. 0.83 -> 0.80-0.89).
+
+    Rapaport $/ct is FLAT across a bracket (0.70-0.89), but market DEMAND is not:
+    it steps at the round-tenth thresholds (0.80, 0.90, 1.00 ...). A 0.83ct stone
+    (above the 0.80 cutoff) lists materially shallower than a 0.72ct one; mixing
+    them drags the comp median deep. Comparable windows must never cross the
+    threshold the stone sits above — verified: 0.71-0.79 J/VVS2 = -45 vs 0.80+ =
+    -40, so a 0.71-0.88 pull mis-anchored a 0.83 stone ~5 pts too deep."""
+    import math
+    lo = math.floor(round(weight, 4) * 10 + 1e-9) / 10.0
+    return round(lo, 2), round(lo + 0.09, 2)
+
+
 def _tight_window(weight: float, delta: float) -> tuple[float, float]:
     """A small size window around the weight, CLAMPED to the stone's Rap bracket
-    so we respect the bracket price cliff and keep the response small/relevant."""
+    so we respect the bracket price cliff and keep the response small/relevant.
+
+    NOTE: the pull stays WIDE on purpose (comp support). The demand-threshold
+    restriction (0.80/0.90/1.00) is applied later to the MEDIAN comps only
+    (`_build_one`), so tightening never starves the segment into a bad fallback."""
     b = size_band(weight)
     blo = SIZE_EDGES[b]
     bhi = SIZE_EDGES[b + 1] - 0.01 if b + 1 < len(SIZE_EDGES) else weight + 1.0
@@ -59,9 +77,13 @@ class LiveMarket:
     """Live Uni comparables with per-segment caching."""
 
     def __init__(self, max_age_days: int = 180, match_lab: bool = True,
-                 min_segment_n: int = 12):
+                 min_segment_n: int = 12, size_tier: bool = True):
         self.max_age_days = max_age_days
         self.match_lab = match_lab
+        # Compute the anchor median from comps in the stone's OWN size-decade
+        # (respecting the 0.80/0.90/1.00 demand thresholds) when well-supported.
+        # Off = legacy behaviour (median over the whole pulled window).
+        self.size_tier = size_tier
         # Minimum live cut-tier comps to PUBLISH a live segment over the banked
         # cut-aware aggregate (matches the anchor's market_median min_n).
         self.min_segment_n = min_segment_n
@@ -105,10 +127,10 @@ class LiveMarket:
         """
         fl_code = fluorescence_code(fluorescence)
         if size_bucket:
-            # 0.10ct sub-bucket within the Rap bracket — size-local, so an upper-
-            # bracket stone (e.g. 0.80 in 0.70-0.89) anchors to its own 0.80-0.89
-            # comps, not the deeper 0.70-0.79 ones (fixes within-bracket lumping).
-            lo, hi = size_bucket_window(weight)
+            # ROUND -> the client's exact price slot (0.84 -> 0.83-0.84, distinct
+            # from 0.85-0.89); other shapes -> a 0.10ct sub-bucket. Either way the
+            # market is pulled size-locally, not lumped across the whole bracket.
+            lo, hi = size_bucket_window(weight, shape)
         elif full_bracket:
             b = size_band(weight)
             blo = SIZE_EDGES[b]
@@ -224,17 +246,30 @@ class LiveMarket:
             return True                   # data-thin, not a failure
         if len(tier_stones) < 5:
             tier_stones = res.stones
-        # Key the live segment by its 0.10ct size sub-bucket so different sizes in
-        # the same Rap bracket don't collide (and don't over/under-discount each
-        # other). Banked (bracket-level) keys remain the fallback in market_median.
+        # Key the live segment by its size sub-slot (client's ROUND price slots;
+        # 0.10ct buckets for other shapes) so different sizes in the same Rap
+        # bracket don't collide. Banked (bracket-level) keys remain the fallback.
         name = "|".join(map(str, segment_keys(st.Shape_full, st.Weight, st.Color,
-                            st.Clarity, getattr(st, "CPS", None))[0])) + size_tag(st.Weight)
+                            st.Clarity, getattr(st, "CPS", None))[0])) + size_tag(st.Weight, st.Shape_full)
         # A thin live segment must not shadow a better-supported banked one.
         if len(tier_stones) < self.min_segment_n and name in segments:
             return True                   # data-thin, not a failure
-        tier_discs = [s["discount"] for s in tier_stones if s.get("discount") is not None]
+        # SIZE-TIER: within a Rap bracket, market demand steps at the round-tenth
+        # thresholds (0.80/0.90/1.00). Take the median from comps in the stone's
+        # OWN size-decade when well-supported (>=8), so a 0.83 stone isn't dragged
+        # deep by sub-0.80 comps (verified: 0.71-0.79 J/VVS2=-45 vs 0.80+=-40).
+        # The wide pull still provides support; only the median narrows. Falls back
+        # to the full tier when the decade is thin, so it never starves.
+        med_stones = tier_stones
+        if self.size_tier:
+            dlo, dhi = _demand_decade(st.Weight)
+            dec = [s for s in tier_stones if s.get("size") is not None
+                   and dlo <= float(s["size"]) <= dhi]
+            if len(dec) >= 8:
+                med_stones = dec
+        tier_discs = [s["discount"] for s in med_stones if s.get("discount") is not None]
         all_med = float(np.median(tier_discs)) if tier_discs else res.report.median_discount
-        clean_med, clean_n = no_bgm_median(tier_stones)
+        clean_med, clean_n = no_bgm_median(med_stones)
         anchor_med = clean_med if clean_n >= 5 else all_med
         segments[name] = {
             "median_discount": round(anchor_med, 2), "n": len(tier_stones),

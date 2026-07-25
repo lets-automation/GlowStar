@@ -81,7 +81,7 @@ class MarketTables:
         # giving up and dropping to the history model.
         if cut_only and cut is not None and cut_graded(shape):
             keys = [k for k in keys if is_cut_aware_key(k)]
-        tag = size_tag(weight)
+        tag = size_tag(weight, shape)     # ROUND -> client's price slot
         for key in keys:
             name = "|".join(map(str, key)) if key else "__global__"
             # Prefer the SIZE-LOCAL live sub-bucket (name#0.80); fall back to the

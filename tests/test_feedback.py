@@ -44,6 +44,14 @@ def test_build_corrections_from_overrides():
     assert corr == 6.0                       # humans priced +6 shallower -> +6 correction
 
 
+def test_online_correction_does_not_fall_back_to_shape_or_global():
+    recs = [dict(decision="override", suggested_discount=-57.0, human_discount=-51.0,
+                 shape_full="Round", weight=1.0, color="G", clarity="SI1", cps="EX")
+            for _ in range(4)]
+    table = build_corrections(recs, min_support=3)
+    assert correction_for(table, "Round", 0.4, "F", "VS1", "EX") == 0.0
+
+
 def test_training_examples_weights_overrides_higher():
     recs = [
         dict(decision="override", suggested_discount=-57.0, human_discount=-51.0,

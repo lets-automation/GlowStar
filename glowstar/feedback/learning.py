@@ -43,7 +43,8 @@ def build_corrections(records: list[dict], min_support: int = 3) -> dict[str, di
         if r.get("decision") != Decision.OVERRIDE.value or r.get("human_discount") is None:
             continue
         delta = float(r["human_discount"]) - float(r["suggested_discount"])
-        for key in segment_keys(r["shape_full"], r["weight"], r["color"], r["clarity"]):
+        for key in segment_keys(r["shape_full"], r["weight"], r["color"], r["clarity"],
+                                r.get("cps")):
             buckets[key].append(delta)
     table: dict[str, dict] = {}
     for key, deltas in buckets.items():
@@ -54,9 +55,16 @@ def build_corrections(records: list[dict], min_support: int = 3) -> dict[str, di
 
 
 def correction_for(table: dict[str, dict], shape: str, weight: float,
-                   color: str, clarity: str) -> float:
-    """Most specific available segment correction for a stone (else 0)."""
-    for key in segment_keys(shape, weight, color, clarity):
+                   color: str, clarity: str, cps=None) -> float:
+    """Return a supported, sufficiently-specific correction (else zero).
+
+    Shape-only and global feedback is deliberately not used online: a returned
+    batch can be directionally unrepresentative, and its broad offset must not
+    move confirmed stones in unrelated price cells.
+    """
+    for key in segment_keys(shape, weight, color, clarity, cps):
+        if len(key) < 3:
+            continue
         name = "|".join(map(str, key)) if key else "__global__"
         if name in table:
             return table[name]["offset"]

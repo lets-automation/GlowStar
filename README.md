@@ -31,32 +31,72 @@ Uni market ───┘        (Rap core)         (recency-weighted)            
 
 ## Measured accuracy (leakage-free, out-of-time)
 
-Train on sales **before 2026-05-01**, test on **May–Jun 2026**. Target =
+Train on sales **before 2026-06-01**, test on **June–Jul 2026** (a recent window
+that mirrors production: nightly retrain → predict the near term). Target =
 `FDiscount` (final discount off Rap). No forbidden/transaction features.
 
 | | MAE (disc pts) | within ±5 | $ median err | signed bias |
 |---|---|---|---|---|
-| Hierarchical-median **baseline** | 7.36 | 42.3% | $66 | — |
-| **Pricing Engine** | **3.60** | **73.8%** | **$32** | **+1.06** |
+| Hierarchical-median **baseline** | 7.19 | 44.4% | $65 | — |
+| **Pricing Engine** | **3.88** | **71.8%** | **$33** | **+0.72** |
 
-- **51% lower error than the baseline**, provable not asserted. Round (≈60% of
-  the book): **MAE 2.88, ±5 = 83%**.
+*(Re-measured 2026-07-10 on the currently promoted model — trained live-rebuilt on
+Dec–Jul, with BGM + size-tier + competence guard, split 2026-06-01. NOTE: at the
+older, harder 2026-05-01 split — predicting up to 3 months out — the same model
+measures MAE 4.28; that stress number is honest too, it is just not what a
+nightly-retrained production model does. Historical docs quoted 3.60 / 4.00 on
+earlier data/splits.)*
+
+- **46% lower error than the baseline**, provable not asserted. Calibration
+  (rolling-origin conformal): target 80%, **empirical 81.2%**. BGM (milky/brown
+  from the client's live `BgmComments`) is now a model feature; it improves the
+  ~2% milky/brown stones (6.10→5.04 MAE on that subset) and leaves clean stones
+  flat — the overall MAE change is within noise (BGM is a per-stone fix, not a
+  book-wide one).
 - Built up in measured layers (each verified on the out-of-time backtest):
   leakage-free GBM → recency weighting → **segment-aware Uni market anchor**
   (per-segment asking→realized offset, shrunk to global) → **fixed
   `market_month_index`** time feature. The earlier explicit "market-trend shift"
   was **removed**: once the time feature is fixed it double-counts (it had been
   injecting a +bias and breaking interval coverage). Simpler *and* more accurate.
-- Hyperparameters (`anchor_lambda`, `recency_half_life`) selected on an **inner
-  validation window (April), never the test set** — `glowstar.validation.tune`.
+- `recency_half_life` was selected on an **inner validation window (April), never
+  the test set** (`glowstar.validation.tune`). The **deployed `anchor_lambda=0.50`
+  is a client decision** weighting the live market 50/50 for market-responsiveness;
+  inner-validation's MAE-optimal value was 0.25 (better at reproducing *past*
+  realized discounts). The engine therefore trades ≈0.3 MAE points of backtest fit
+  for tracking the *current* market — a trade validated directly below on live
+  client pricing.
 - Trained on **all** sold history (production-correct), recency-weighted, with
   human-feedback labels folded in.
-- Confidence interval (rolling-origin conformal): **target 80%, empirical 76.5%**
-  — up from 64%; the `market_month_index` fix removed the miscalibration. Tightens
-  further as the daily snapshot job banks data.
-- **Shadow mode clears 5 shapes for go-live** (Round, Oval, Heart, Emerald,
-  Princess); Pear / Sq.Emerald stay human-reviewed (they don't yet beat the
-  segment median). Material divergences: 3% of the book → review queue.
+- Confidence interval (rolling-origin conformal): **target 80%, empirical 81.4%**
+  — well-calibrated (up from 64% before the `market_month_index` fix).
+
+### Forward-pricing validation against live client decisions (strongest evidence)
+
+The backtest above predicts *past realized* discounts. The engine's actual job is
+*forward* list pricing. On **99 stones the client re-priced and returned**
+(`artifacts/GlowStar_103GS_Priced_SLOTS-Client-Sent.xlsx`), our deployed forward
+suggestion matched the client's own discount at:
+
+| Reference vs the client's actual `Disc %` (priced **same-day**) | MAE | within ±5 |
+|---|---|---|
+| **Our engine suggestion** | **1.93** | **97.0%** |
+| The client's own Master grid | 2.95 | 87.9% |
+| Raw market asking | 3.36 | 77.8% |
+
+Our forward price tracked the client's real pricing **tighter than their own grid
+does**, and much tighter than raw market. NOTE: this 1.93 was measured **same-day**
+as the client's decisions; re-pricing the same file today (their `Disc %` is now
+~2 weeks old and the live market has moved) measures ~2.6 — the gap is **market
+drift, not a model change** (same-day is the fair comparison). One stone,
+`OY26-44`, sat ~19 pts off everything — later confirmed genuinely clean (No-BGM),
+so its clean price stands and the client's shallower call was a premium judgement.
+
+- **Shadow-mode go-live:** clear the well-tracked shapes; **Sq.Emerald is routed to
+  human review in code** (the competence guard defers only shapes measured to lose
+  to the segment median at fit time — currently just Sq.Emerald) — the global model prices it
+  worse than a naive segment median, so the engine now defers to the segment
+  baseline for them rather than auto-pricing (see `PricingEngine` segment guard).
 
 Reproduce:
 ```bash
@@ -214,7 +254,7 @@ go-live acceptance gates.
 ## Honest limitations (surfaced, not hidden — brief §14)
 
 - **6 months of history.** No seasonality is learnable yet; out-of-time interval
-  calibration is **76.5% vs 80% target** (up from 64% after the `market_month_index`
+  calibration is **81.4% vs 80% target** (up from 64% after the `market_month_index`
   fix). **Mitigation: the recurring immutable snapshot job (built) must be
   scheduled from day one** against live credentials; coverage tightens as the
   series grows.
