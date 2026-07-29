@@ -30,7 +30,12 @@ _RAP_CHANGE_CI_WIDEN_PTS = 4.0
 
 
 class StoneIn(BaseModel):
-    """A stone to price. Only pricing-time attributes; no transaction fields."""
+    """A stone to price. Only pricing-time attributes; no transaction fields.
+
+    Deliberately small: the CALLER should have to supply the five things that
+    identify a stone, and nothing that we can determine ourselves or that they
+    could get wrong.
+    """
 
     StoneId: str = ""
     Shape_full: str
@@ -41,14 +46,46 @@ class StoneIn(BaseModel):
     Fluorescence: str = "Non"
     Lab: str = "GIA"
     Location: str = "NA"
-    Rap: float = Field(gt=0)
-    # Optional soft attributes (market-learned adjustment applies when present).
-    milky: str | None = None
+    # Rap is OPTIONAL — we look it up from the licensed sheet when it is absent.
+    #
+    # It used to be required, which quietly made the caller responsible for the
+    # yardstick every price is measured against. That is the single worst field to
+    # delegate: a CRM holding a stale Rap would shift EVERY discount we return, and
+    # nothing in the response would look wrong. It is also exactly the failure that
+    # already bit this project once (their sheet re-based 0.30-0.39 rounds ~+7% and
+    # our $/ct went stale for that band alone).
+    #
+    # Our sheet is verified against the client's own book at 100% exact on recent
+    # sales, so looking it up is both safer and less work for them. A caller may
+    # still pass Rap to override — e.g. to reproduce a historical quote.
+    Rap: float | None = Field(default=None, gt=0)
+    # Measurements — enable the spread/face-up premium on rounds (market/spread.py).
+    Length: float | None = None
+    Width: float | None = None
+    Depth: float | None = None
+    # Tinge, as the client's inventory API now supplies it (Brown/Milky/Shade/Green).
+    Brown: str | None = None
+    Milky: str | None = None
     Shade: str | None = None
+    Green: str | None = None
+    # Legacy aliases kept so an older caller does not break.
+    milky: str | None = None
 
 
 class PricingService:
-    def __init__(self, engine: PricingEngine | None = None, use_feedback: bool = True,
+    # DEFAULT use_feedback=False. It used to default to True, which is the
+    # override-echo trap (CLAUDE.md Trap 2): with feedback on, re-pricing a stone
+    # the desk has already corrected replays THEIR OWN number back at them. Every
+    # reviewed stone then lands on target to the decimal — it looks like a triumph,
+    # measures nothing, and collapses on the next unseen file.
+    #
+    # It matters far more now than it did as a batch script: once the CRM calls
+    # this service live, this is THE pricing path, and the desk re-prices stones
+    # they have already touched all day long.
+    #
+    # Feedback is still LOADED (for segment analytics and the reason summary); it
+    # simply never rewrites a price unless a caller explicitly opts in.
+    def __init__(self, engine: PricingEngine | None = None, use_feedback: bool = False,
                  prefer_registry: bool = True, rap_monitor: RapChangeMonitor | None = None):
         self._feedback = fbstore.load_all() if use_feedback else []
         # Rap-change "red line": flags a stone whose Rap cell just moved and widens
@@ -76,6 +113,34 @@ class PricingService:
         # Price "as of now": use the most recent known date as the market clock.
         row["MarketSheetDate_dt"] = self._asof
         row["OrderDate_dt"] = self._asof
+
+        # Rap: look it up unless the caller deliberately supplied one. Doing this
+        # here (not in the caller's CRM) keeps one licensed sheet as the single
+        # yardstick — see StoneIn.Rap.
+        if not row.get("Rap"):
+            from ..reference import rap_lookup as RL
+            res = RL.lookup(shape_code=None, shape_full=stone.Shape_full,
+                            weight=stone.Weight, color=stone.Color, clarity=stone.Clarity)
+            if res.ok:
+                row["Rap"] = res.price_per_ct
+                row["Rap_status"] = "ok"
+            elif res.floor_estimate:
+                # A labelled estimate, never silently passed off as published.
+                row["Rap"] = res.floor_estimate
+                row["Rap_status"] = res.status.value
+            else:
+                raise ValueError(
+                    f"No Rapaport price for {stone.Weight}ct {stone.Color}/{stone.Clarity} "
+                    f"{stone.Shape_full} ({res.status.value}): {res.note}")
+
+        # Tinge -> the ordinals the model was trained on. Accept the client's
+        # structured codes (LBR/MML/HMT/...) exactly as their inventory API emits
+        # them, so the CRM forwards its own field values with no translation.
+        from ..data.loaders import parse_tinge
+        for src, suffix, col in (("Brown", "BR", "brown_ord"), ("Milky", "ML", "milky_ord"),
+                                 ("Shade", "MT", "shade_ord"), ("Green", "GR", "green_ord")):
+            raw = row.get(src)
+            row[col] = parse_tinge(raw, suffix) if raw is not None else float("nan")
         return pd.DataFrame([row])
 
     def price(self, stone: StoneIn, *, explain: bool = True) -> dict:

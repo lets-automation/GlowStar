@@ -21,6 +21,8 @@ data/snapshots/
 # rebuild only via `glowstar.market.grid_history.bank_history(days=N)`.
 data/master_grid/
 
+MOU.md
+
 # Large reference dumps (provided out-of-band, never committed)
 UNI_BGMFILEDWITH.json
 response.json

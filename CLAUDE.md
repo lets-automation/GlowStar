@@ -181,8 +181,20 @@ feature and the report shows cell age — keep both.
   sample once made me tell the client something was impossible when it wasn't —
   the live API disproved it.
 - `records.json` is rebuilt fresh from the live API on every retrain.
-- **Rapaport list is STATIC** (April CSV; no live feed exists). Affects `$/ct`, not
-  the discount.
+- **Rapaport list is STATIC** — there is no live feed; the client sends the CSV.
+  Affects `$/ct`, NOT the discount. **It goes stale silently and the desk feels it
+  as "your dollars are wrong".** Rap re-based 0.30-0.39 rounds ~+7% in July 2026
+  while every other band held; our April sheet then printed thirties ~7% low, and
+  thirties were half the stones the desk escalated.
+  - **Detect it:** compare our lookup against the client's OWN `Rap` field on
+    RECENT sales, per size band. Their book is the truth. A band at <100% exact
+    while others are 100% = a re-base, not noise. (An implied-Rap check from live
+    UNI `ppc / (1 + stone_discount/100)` finds it too.)
+  - **Fix it:** ask the client for their current sheet — licensed, never scrape,
+    never reconstruct from market implieds. Install it, then `rap_versioning.ingest_list`.
+  - Bracket coverage is a property of THE SHEET, not a constant. The 26-06-2026
+    sheet publishes 5.00-9.99 and 10.00-99.00, so the classic 6-9.99 "gap" does
+    not exist for this client. Never hardcode brackets — read them from the file.
 - Credentials live in `.env`. `ingestion/http.py` sanitises URLs in errors — some
   creds are path-embedded and used to leak into job logs.
 

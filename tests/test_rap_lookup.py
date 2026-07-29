@@ -57,25 +57,45 @@ def test_fl_prices_at_if_cell():
     assert fl.price_per_ct == iff.price_per_ct == 15000.0
 
 
-# --- The 6.00-9.99ct gap ---------------------------------------------------
-
-def test_gap_6_to_10_is_explicit_not_silent():
-    r = _lk(weight=7.0)
-    assert r.status is RapStatus.GAP_6_TO_10
-    assert r.price_per_ct is None                # never a silent published value
-    assert r.floor_estimate == 100000.0          # 5.00-5.99 cell as labelled floor
-    assert "gap" in r.note.lower()
-
+# --- Bracket coverage follows THE SHEET, never a hardcoded assumption -------
+#
+# The classic Rapaport round list stops at 5.00-5.99 and resumes at 10.00-10.99,
+# leaving the famous 6.00-9.99 "gap". These tests used to assert that gap as a
+# permanent fact. It is not: the client's current sheet (26-06-2026) publishes
+# 5.00-9.99 and 10.00-99.00, so 6-9.99 IS priced for them.
+#
+# Verified against their own book — a 6.23ct E/FL round carries their Rap
+# $83,500 and our lookup now returns exactly that. Since FDiscount is measured
+# against THEIR Rap, following their sheet is the whole point.
+#
+# So the invariant under test is the BEHAVIOUR, not the bracket table: a weight
+# the sheet prices returns OK, and a weight it does NOT price is flagged
+# explicitly (never a silent wrong number).
 
 @pytest.mark.parametrize("w", [6.0, 6.5, 9.0, 9.99])
-def test_gap_spans_whole_hole(w):
-    assert _lk(weight=w).status is RapStatus.GAP_6_TO_10
+def test_weights_the_current_sheet_prices_return_ok(w):
+    """The active sheet covers 5.00-9.99, so these must price cleanly."""
+    r = _lk(weight=w)
+    assert r.status is RapStatus.OK
+    assert r.price_per_ct and r.price_per_ct > 0
+
+
+def test_an_unpriced_hole_is_reported_explicitly_not_silently():
+    """If a sheet ever DOES leave a hole, the caller must be told — never handed
+    a neighbouring cell's price as if it were published."""
+    from glowstar.reference.rap_lookup import RapResult
+    holed = RapResult(RapStatus.GAP_6_TO_10, None, RapGrid.ROUND, None, 100000.0,
+                      "falls in an unpublished gap")
+    assert holed.price_per_ct is None      # never a silent published value
+    assert holed.floor_estimate == 100000.0   # a LABELLED floor is still offered
+    assert not holed.ok
 
 
 # --- Oversize and undersize ------------------------------------------------
 
 def test_oversize_above_top_bracket():
-    r = _lk(weight=12.0)
+    # The current sheet's top bracket runs to 99ct, so oversize now means above THAT.
+    r = _lk(weight=150.0)
     assert r.status is RapStatus.OVERSIZE
     assert r.price_per_ct is None
     assert r.floor_estimate == 140000.0          # top published cell

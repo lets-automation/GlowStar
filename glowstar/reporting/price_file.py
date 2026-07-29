@@ -21,6 +21,7 @@ from ..feedback import store as fbstore
 from ..models.engine import PricingEngine, EngineConfig
 from ..reference import rap_lookup as RL
 from .client_report import _confidence, _fluor_label, _is_broad_market, _note, _why
+from ..feedback.store import VARIANCE_REASON_THRESHOLD_PTS as _THR
 
 log = logging.getLogger(__name__)
 
@@ -284,13 +285,21 @@ def _feedback_guide() -> pd.DataFrame:
         "rare_item": "Rare shape/size — manual call",
         "other": "Anything else (use 'Your note')",
     }
+    from ..feedback.store import VARIANCE_REASON_THRESHOLD_PTS as THR
     rows = [
         ("HOW TO USE", "In each row, fill 'Your decision' with accept, reject, or override. "
-         "For reject/override add a Reason code below. For override also fill 'Your price ($/ct)'. "
+         "For override also fill 'Your price ($/ct)'. "
          "Return the file — we load it so the model learns from your decisions."),
         ("DECISION: accept", "You're happy with the suggestion (confirms it to the model)."),
-        ("DECISION: reject", "Wrong, but you're not giving a price — Reason required."),
-        ("DECISION: override", "You'd price it differently — Reason + Your price required."),
+        ("DECISION: reject", "Wrong, but you're not giving a price — Reason required "
+                             "(there's no price for us to learn from)."),
+        ("DECISION: override", "You'd price it differently — just fill in your price."),
+        ("", ""),
+        (f"REASON — only if you move us by more than {THR:.0f} pts",
+         f"If your price is within {THR:.0f} points of ours, LEAVE THE REASON BLANK — "
+         "that's normal trading judgement and we still learn from the price itself. "
+         f"Only when the gap is bigger than {THR:.0f} points do we need the reason, so the "
+         "model learns WHY it was wrong and not just that it was."),
         ("", ""),
         ("REASON CODE", "When to use it"),
     ]
@@ -336,6 +345,40 @@ def _grid_check(row: dict, s, cell, predicted: float | None = None) -> dict:
             "Grid check": note}
 
 
+def _attention(s, cell) -> str:
+    """Does this stone need the desk's eyes BEFORE they read the price?
+
+    The client asked the system to "seek attention" on the ones that matter. We
+    cannot know their price yet, so we flag the cases where OUR OWN evidence says
+    the number is shaky — thin/absent market support, an attribute we have measured
+    ourselves to price badly, or a big gap against their own fresh grid cell.
+    Everything else stays quiet, which is what makes the flags worth reading.
+    """
+    reasons: list[str] = []
+    if "fluor_review" in s.flags:
+        reasons.append("strong fluorescence on a near-colourless stone — we price these too high")
+    if "bgm_review" in s.flags:
+        reasons.append("medium/heavy tinge — we under-discount severe brown/milky")
+    if "rare_shape" in s.flags:
+        reasons.append("rare shape — thin history")
+    if "fancy_color" in s.flags:
+        reasons.append("fancy colour — off the white Rapaport list")
+    if "high_value" in s.flags:
+        reasons.append("high-value stone")
+    if s.method == "fallback":
+        reasons.append("too little data for the model — this is an estimate")
+    elif _is_broad_market(s) or (s.comparable_count and s.comparable_count < 8):
+        reasons.append("few close market comparables")
+    # A big, FRESH grid gap is a genuine disagreement worth a human look. A stale
+    # cell is not — the grid moves thousands of cells a day and staleness is exactly
+    # what the engine is meant to catch.
+    if cell is not None and not cell.is_stale:
+        drift = abs(s.suggested_discount - cell.discount)
+        if drift > _THR:
+            reasons.append(f"differs {drift:.1f} pts from your own current grid cell")
+    return "REVIEW: " + "; ".join(reasons) if reasons else ""
+
+
 def _ext_row(row: dict, s, cell=None, predicted: float | None = None) -> dict:
     """Clean client row for an external (not-yet-sold) stone — includes the cert,
     the Rap basis, what the market is asking, and the client's own grid + drift."""
@@ -358,6 +401,7 @@ def _ext_row(row: dict, s, cell=None, predicted: float | None = None) -> dict:
         "Fair range ($/ct)": f"${float(row['Rap'])*(1+s.ci_discount_low/100):,.0f} – "
                              f"${float(row['Rap'])*(1+s.ci_discount_high/100):,.0f}",
         "Confidence": _confidence(s),
+        "Needs your review": _attention(s, cell),
         "Market comps (n)": "broad market" if _is_broad_market(s) else s.comparable_count,
         **_grid_check(row, s, cell, predicted),
         "Note": _note(s),
@@ -366,8 +410,11 @@ def _ext_row(row: dict, s, cell=None, predicted: float | None = None) -> dict:
         # system loader (feedback.intake.ingest_feedback_excel) reads them back
         # into the feedback store so the model learns. Empty by default.
         "Your decision (accept/reject/override)": "",
-        "Reason (if reject/override)": "",
         "Your price ($/ct) (if override)": "",
+        # Reason is OPTIONAL for a small correction (client rule): a gap inside the
+        # threshold is ordinary trading judgement and forcing a code produces junk
+        # codes, not insight. It is only needed once the gap is material.
+        f"Reason (only if you move us > {int(_THR)} pts)": "",
         "Your note": "",
     }
     if row.get("Rap_status") and row["Rap_status"] != "ok":
@@ -521,6 +568,9 @@ def price_and_report(path: str | Path, *, live: bool = True, retrain: bool = Tru
         ("Sale price ($/ct) / Sale total ($)", "The same Sale suggestion, in $/ct and total $."),
         ("Asking discount (% below Rap)", "Reference only: where comparable stones are currently LISTED in the live market."),
         ("Your Master grid (% below Rap)", "Your OWN price sheet's number for this cell (live), shown for COMPARISON ONLY. Our Sale price is built from your sales history + the live market and does NOT use this grid."),
+        ("Needs your review", "Blank for most stones. When filled, OUR OWN checks say this "
+         "number is shaky — thin market data, an attribute we know we price badly, or a big "
+         "gap against your own current grid cell. Please set these yourself."),
         ("Grid check", "A side-by-side note on whether our (independently-computed) Sale lands near your grid — a confidence cross-check, not an input to the price."),
         ("Rapaport list ($/ct)", "The reference per-carat list price for this exact shape/size/colour/clarity."),
         ("Fluorescence", "How much the stone glows under UV (None → Very Strong). The engine factors it into price."),

@@ -159,6 +159,25 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
     if promote:
         registry.set_current(version)
 
+    # Is the desk's feedback ready to TRAIN on yet? Reported every night so
+    # "switch it on once there's enough data" is a measured event, not something
+    # someone has to remember to check. It never flips the switch itself.
+    try:
+        from ..feedback.readiness import assess, format_report
+        log.info("%s", format_report(assess()))
+    except Exception:
+        log.exception("Feedback readiness check failed (non-fatal).")
+
+    # Housekeeping: a nightly ~9 MB artifact is ~3.2 GB/year and fills the disk of
+    # a server nobody is watching. Keep the rollback window + the promoted history.
+    try:
+        pruned = registry.prune()
+        if pruned["removed"]:
+            log.info("Pruned %d old model artifacts (freed %.0f MB).",
+                     len(pruned["removed"]), pruned["freed_mb"])
+    except Exception:
+        log.exception("Registry prune failed (non-fatal; the new model is saved).")
+
     summary = {"version": version, "promoted": promote, "reason": reason,
                "metrics": metrics, "n_sold": len(sold), "n_test": info.n_test,
                "n_feedback": len(feedback)}

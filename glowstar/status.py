@@ -28,6 +28,34 @@ def _age(ts) -> str:
         return "?"
 
 
+def _rap_status() -> None:
+    """Print the ACTIVE Rap sheet's own date + how far behind the client it is.
+
+    Rapaport re-bases one size band at a time (July 2026: 0.30-0.39 rounds ~+7%,
+    everything else unchanged). A stale sheet leaves the DISCOUNT correct but the
+    $/ct wrong for that band only — invisible to every internal metric, and the
+    desk experiences it as a pricing error. So surface the date, not a guess.
+    """
+    import csv
+    from .config import PATHS
+    for label, path in (("round", PATHS.rap_round), ("fancy", PATHS.rap_pear)):
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                dates = {r[6].strip() for r in csv.reader(fh) if len(r) > 6 and r[6].strip()}
+            stamp = ", ".join(sorted(dates)) if dates else "no date column"
+            print(f"rapaport {label:<6}: {stamp}   ({path.name})")
+        except OSError:
+            print(f"rapaport {label:<6}: MISSING ({path})")
+    try:
+        from .reference.rap_versioning import list_versions
+        v = list_versions()
+        print(f"  versions    : {v if v else 'none ingested'}")
+    except Exception:
+        pass
+    print("  STATIC — no live feed. Affects $/ct, NOT the discount. Verify against the")
+    print("  client's own Rap on recent sales per size band; ask them for a new sheet.")
+
+
 def main() -> None:
     print("=" * 66)
     print("GLOWSTAR ENGINE STATUS")
@@ -98,10 +126,20 @@ def main() -> None:
     except Exception as e:
         print(f"feedback      : unreadable ({type(e).__name__})")
 
+    # --- is feedback ready to train on yet? (measured, not remembered) ---
+    try:
+        from .feedback.readiness import format_report
+        print(format_report())
+    except Exception as e:
+        print(f"feedback readiness: unavailable ({type(e).__name__})")
+
     # --- config that changes pricing ---
     print(f"backtest split: {SETTINGS.backtest_split_date}")
-    print(f"rapaport list : STATIC ({SETTINGS.rap_csv if hasattr(SETTINGS, 'rap_csv') else 'April CSV'}) "
-          "— affects $/ct, not the discount")
+    # Read the sheet's OWN date. This line used to hardcode "April CSV" and stayed
+    # that way after the client sent a newer sheet — the exact rot this command
+    # exists to prevent. The Rap sheet is the yardstick for every $/ct we publish,
+    # so a stale one is felt by the desk as "your dollars are wrong".
+    _rap_status()
     print("=" * 66)
     print("Numbers above are MEASURED now. Do not copy them into any document —")
     print("point at this command instead.")

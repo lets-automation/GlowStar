@@ -106,3 +106,56 @@ def list_versions() -> list[str]:
     if not MODELS_DIR.exists():
         return []
     return sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir())
+
+
+# A nightly retrain writes an ~9 MB engine every day: ~3.2 GB a year, and the disk
+# fills silently on a server nobody is watching. Keep enough to audit and roll
+# back, delete the rest.
+KEEP_RECENT = 14          # ~2 weeks of daily retrains — the practical rollback window
+KEEP_PROMOTED = 5         # plus the last few that actually SERVED prices
+
+
+def prune(keep_recent: int = KEEP_RECENT, keep_promoted: int = KEEP_PROMOTED,
+          dry_run: bool = False) -> dict:
+    """Delete old model artifacts, keeping what audit and rollback actually need.
+
+    ALWAYS kept, regardless of the limits:
+      * the version `current.json` points at — deleting the live model would take
+        serving down at the next restart;
+      * the most recent `keep_recent` versions (rollback window);
+      * the most recent `keep_promoted` versions that were PROMOTED — a promoted
+        model priced real stones, so its card is the audit trail for those quotes.
+
+    The metrics.json card is kept for every version even when its engine file is
+    deleted: the card is tiny and is what proves what accuracy was claimed when.
+    """
+    versions = list_versions()
+    cur = current_version()
+    keep: set[str] = set(versions[-keep_recent:]) | ({cur} if cur else set())
+
+    promoted: list[str] = []
+    for v in versions:
+        card_p = MODELS_DIR / v / "metrics.json"
+        try:
+            if json.loads(card_p.read_text(encoding="utf-8")).get("promoted"):
+                promoted.append(v)
+        except (OSError, ValueError):
+            keep.add(v)                   # unreadable card: never silently delete
+    keep |= set(promoted[-keep_promoted:])
+
+    freed, removed = 0, []
+    for v in versions:
+        if v in keep:
+            continue
+        eng = MODELS_DIR / v / "engine.joblib"
+        if not eng.exists():
+            continue
+        size = eng.stat().st_size
+        if not dry_run:
+            eng.unlink()                  # card stays: the audit trail survives
+        freed += size
+        removed.append(v)
+    log.info("Registry prune: removed %d engine files, freed %.0f MB (kept %d)%s",
+             len(removed), freed / 1e6, len(keep), " [dry run]" if dry_run else "")
+    return {"removed": removed, "freed_mb": round(freed / 1e6, 1),
+            "kept": sorted(keep), "dry_run": dry_run}
