@@ -110,7 +110,7 @@ def run_backtest(split_date: str | None = None) -> dict:
 
 def _fmt(title: str, m: dict) -> str:
     return (f"  {title:<10} n={m['n']:>5}  MAE={m['mae']:.2f}  MedAE={m['medae']:.2f}  "
-            f"±3={m['within3']:.1%}  ±5={m['within5']:.1%}  "
+            f"±2={m['within2']:.1%}  ±3={m['within3']:.1%}  ±5={m['within5']:.1%}  "
             f"$MedAE={m['dollar_medae']:,.0f}  $MAE={m['dollar_mae']:,.0f}")
 
 

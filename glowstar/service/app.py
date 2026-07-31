@@ -37,6 +37,8 @@ except ImportError:  # pragma: no cover - server is optional
     FastAPI = None
 
 from .pricing_service import PricingService, StoneIn
+from .frontoffice import (FrontOfficeStone, FrontOfficeReason,
+                          MasterDiscountRequest)
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +220,116 @@ if FastAPI is not None:
             "threshold_pts": VARIANCE_REASON_THRESHOLD_PTS,
             "needs_attention": needs_attention(d.suggested_discount, human),
             "reason_required": needs_attention(d.suggested_discount, human),
+        }
+
+    # ----------------------------------------------------------------------
+    # FrontOffice contract (their spec, 29-07-2026) — their field names, their
+    # response shape, so their CRM binds to it without a translation layer.
+    # ----------------------------------------------------------------------
+    @app.post("/frontoffice/price", dependencies=[Depends(require_key)])
+    def fo_price(stones: list[dict]) -> list:
+        """Spec #1 — bulk stone pricing. One response row per stone.
+
+        Takes raw dicts rather than a typed list on purpose: FastAPI validates a
+        typed list all-or-nothing, and one malformed row must never cost the desk
+        the other 4,999 prices. Each row is validated individually below.
+        """
+        from .frontoffice import price_stones
+        if len(stones) > 5000:
+            raise HTTPException(status_code=413, detail="max 5000 stones per call")
+        parsed, bad = [], []
+        for i, raw in enumerate(stones):
+            try:
+                parsed.append(FrontOfficeStone(**raw))
+            except Exception as e:
+                # A malformed row is reported in place; it never fails the book.
+                bad.append({"StoneId": (raw or {}).get("stoneId"), "index": i,
+                            "AIDiscount": None, "Error": f"invalid stone: {e}"})
+        return price_stones(parsed, _get_service()) + bad
+
+    @app.post("/frontoffice/reason", dependencies=[Depends(require_key)])
+    def fo_reason(fr: FrontOfficeReason) -> dict:
+        """Spec #2 — the desk's reason for a stone, by certificate number.
+
+        Their document sends certificateNo + reason + aiDiscount but NOT the
+        desk's own price. A reason with no corrected price records THAT we were
+        wrong, never WHAT right looks like — there is no label to train on. So
+        `deskDiscount`/`deskPpc` is accepted and, when present, is what makes the
+        record trainable. Without it the reason is stored as analytics only, and
+        the response says so rather than implying the model learned something.
+        """
+        from ..feedback.store import (Decision, FeedbackRecord, record,
+                                      VARIANCE_REASON_THRESHOLD_PTS,
+                                      needs_attention, variance_pts)
+        desk = fr.deskDiscount
+        if desk is None and fr.deskPpc is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="deskPpc needs the stone's Rap to convert; send deskDiscount "
+                       "or include rap")
+        rec = FeedbackRecord(
+            stone_id=fr.stoneId or fr.certificateNo,
+            decision=(Decision.OVERRIDE.value if desk is not None else Decision.REJECT.value),
+            suggested_discount=fr.aiDiscount, suggested_net=0.0,
+            shape_full="NA", weight=0.0, color="NA", clarity="NA",
+            reason_code=fr.reason, note=f"certificateNo={fr.certificateNo}",
+            human_discount=desk, user=fr.user or "",
+        )
+        try:
+            record(rec)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from None
+
+        v = variance_pts(fr.aiDiscount, desk)
+        return {
+            "recorded": True,
+            "certificateNo": fr.certificateNo,
+            "trainable": desk is not None,
+            "note": ("stored as a training label" if desk is not None else
+                     "stored for ANALYTICS ONLY — send deskDiscount (the desk's own "
+                     "price) to make this a training label"),
+            "variance_pts": None if v is None else round(v, 2),
+            "threshold_pts": VARIANCE_REASON_THRESHOLD_PTS,
+            "needs_attention": needs_attention(fr.aiDiscount, desk),
+        }
+
+    @app.post("/frontoffice/master-discount", dependencies=[Depends(require_key)])
+    def fo_master_discount(m: MasterDiscountRequest) -> dict:
+        """Spec #3 — price a GRID CELL (a weight range), not one stone.
+
+        Answered at the MIDPOINT of the requested weight range, which is what a
+        cell-level discount means. The support behind it is returned too: a cell
+        the engine cannot back with data must not read like one it can.
+        """
+        from .frontoffice import to_stone_in
+        from .tradeability import tradeability_for
+        if m.toWeight < m.fromWeight:
+            raise HTTPException(status_code=422, detail="toWeight must be >= fromWeight")
+
+        mid = (m.fromWeight + m.toWeight) / 2.0
+        stone = FrontOfficeStone(
+            stoneId=f"CELL-{m.fromWeight}-{m.toWeight}", shape=m.shape, weight=mid,
+            color=m.color, clarity=m.clarity, cps=m.cps or "3EX",
+            fluorescence=m.floro or "Non", lab="GIA")
+        try:
+            res = _get_service().price(to_stone_in(stone))
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"cannot price this cell: {e}") from None
+        f = res["suggestion"]
+        tr = tradeability_for(m.shape, mid, m.color, m.clarity)
+        return {
+            "fromWeight": m.fromWeight, "toWeight": m.toWeight,
+            "pricedAtWeight": round(mid, 2),
+            "color": m.color, "clarity": m.clarity,
+            "cps": m.cps, "floro": m.floro, "shape": m.shape,
+            "AIDiscount": f["suggested_discount"],
+            "AIPricePerCarat": f["suggested_ppc"],
+            "FairRangeLow": f["ci_discount_low"],
+            "FairRangeHigh": f["ci_discount_high"],
+            "MarketComparables": f.get("comparable_count"),
+            "Tradeability": tr["label"], "TradeabilityDays": tr["median_days"],
+            "Method": f.get("method"),
+            "Note": "cell-level discount, priced at the midpoint of the weight range",
         }
 
     @app.get("/feedback/summary", dependencies=[Depends(require_key)])

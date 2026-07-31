@@ -63,10 +63,10 @@ def main() -> None:
     print(f"\nSplit @ {s['split_date']}:  train={s['n_train']:,}  test={s['n_test']:,}  "
           "(leakage-free; recency-weighted; market-anchored; conformal bands)\n")
     print(f"  ENGINE    MAE={e['mae']:.2f}  MedAE={e['medae']:.2f}  "
-          f"±3={e['within3']:.1%}  ±5={e['within5']:.1%}  "
+          f"±2={e['within2']:.1%}  ±3={e['within3']:.1%}  ±5={e['within5']:.1%}  "
           f"$MedAE={e['dollar_medae']:,.0f}  $MAE={e['dollar_mae']:,.0f}")
     print(f"  BASELINE  MAE={b['mae']:.2f}  MedAE={b['medae']:.2f}  "
-          f"±3={b['within3']:.1%}  ±5={b['within5']:.1%}  "
+          f"±2={b['within2']:.1%}  ±3={b['within3']:.1%}  ±5={b['within5']:.1%}  "
           f"$MedAE={b['dollar_medae']:,.0f}  $MAE={b['dollar_mae']:,.0f}")
     lift = b["mae"] - e["mae"]
     print(f"\n  -> engine beats baseline by {lift:.2f} MAE pts ({lift / b['mae']:.1%} lower); "

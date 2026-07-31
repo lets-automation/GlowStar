@@ -71,6 +71,7 @@ def main() -> None:
     if card:
         print(f"model         : {card.get('version')}   trained {card.get('trained_at')}")
         print(f"  out-of-time : MAE={card.get('test_mae')}  "
+              f"within2={card.get('test_within2')}  "
               f"within5={card.get('test_within5')}  "
               f"coverage={card.get('test_coverage')}")
         print(f"  trained on  : {card.get('n_train', '?'):,} rows"

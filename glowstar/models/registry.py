@@ -41,6 +41,7 @@ class ModelCard:
     trained_at: str
     n_train: int
     test_mae: float | None = None
+    test_within2: float | None = None
     test_within5: float | None = None
     test_coverage: float | None = None
     promoted: bool = False

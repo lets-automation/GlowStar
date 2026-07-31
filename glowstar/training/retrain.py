@@ -93,6 +93,7 @@ def _evaluate(engine: PricingEngine, test) -> dict:
     m = M.compute(pred, test)
     return {
         "mae": round(m.mae, 3),
+        "within2": round(m.within2, 3),
         "within5": round(m.within5, 3),
         "coverage": round(M.interval_calibration(lo, hi, actual), 3),
         "bias": round(float(np.mean(pred - actual)), 3),
@@ -153,7 +154,8 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
     version = datetime.now().strftime("%Y%m%dT%H%M%S")
     card = registry.ModelCard(
         version=version, trained_at=datetime.now().isoformat(timespec="seconds"),
-        n_train=len(sold), test_mae=metrics["mae"], test_within5=metrics["within5"],
+        n_train=len(sold), test_mae=metrics["mae"],
+        test_within2=metrics.get("within2"), test_within5=metrics["within5"],
         test_coverage=metrics["coverage"], promoted=promote, notes=reason)
     registry.save_engine(prod, card)
     if promote:

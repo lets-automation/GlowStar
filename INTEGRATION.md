@@ -267,3 +267,97 @@ Steps 1–2 take a few days once the server exists.
 
 Ask us. If any field or reply here is unclear, tell us and we will change it — it
 is easier to fix the contract now than after your screens are built.
+
+---
+
+# Appendix A — Response to "For FrontOffice API" (29-07-2026)
+
+We have built all three endpoints to your specification. Field names and response
+shape are exactly as your document asks, so your CRM can bind to them directly.
+
+| Your spec | Endpoint | Status |
+|---|---|---|
+| 1. Bulk stone pricing | `POST /frontoffice/price` | **Ready** |
+| 2. Add our reason | `POST /frontoffice/reason` | **Ready** — see A.2 |
+| 3. Pricing Master Discount AI | `POST /frontoffice/master-discount` | **Ready** |
+
+## A.1 — Bulk pricing: what each response field is
+
+Per stone you get: `StoneId`, `CertificateNo`, `AIDiscount`, `AIPricePerCarat`,
+`AITotal`, `FairRangeLow/High`, `Reason`, `Tradeability`, `TradeabilityDays`,
+`TradeabilityBasis`, `ConfidenceScore`, `AIScore`, `NeedsReview`, `Flags`.
+
+**Three things to know before you build the screen.**
+
+**(a) We accept every field you send — but we only PRICE on the ones our sales
+history contains.** Your request includes `eyeClean`, `luster`, `bowtie`,
+`iGrade`, the black/white/open/natural family, `kapan`, `article`, `grade`. We
+checked your live inventory API: those fields are not in it, so they are not in
+the sales history either, so the model has never seen them and cannot price on
+them. We store them and list them back in `ReceivedNotYetPriced` — you will see
+exactly what did and did not influence the number, rather than assuming.
+
+As those fields start appearing in the daily data they become learnable, and we
+add them deliberately with a measured before/after.
+
+**Used today:** shape, weight, colour, clarity, cut/polish/symmetry (or cps),
+fluorescence, lab, brown, milky, shade, green, and the measurement block
+(length, width, depth, ratio, table, girdle, crown/pavilion angles, mGrade).
+
+**(b) `AIScore` returns `null` for now.** The overall score needs the Demand,
+Competition and Liquidity inputs (the eight-parameter score). Demand needs your
+search/enquiry data — we tested `GetCustomerSearchHistories` and it works, but it
+carries no buyer identity and no offer/video-view events, so per-stone demand is
+not yet measurable. **A wrong score is worse than an honest blank**, so the field
+is present and null with a status string, not invented.
+
+**(c) `Tradeability` is provisional, and it is honest about why.** It returns your
+five buckets (High / Semi High / Medium / Semi Slow / Slow) plus the number of
+days and the basis it used.
+
+Two corrections went into this, pulling in opposite directions:
+
+- Counting only **sold** stones looks too fast — the slowest goods have not sold
+  yet, so they never enter the average. Stock is therefore counted as "has taken
+  at least N days so far".
+- But counting **all** stock looks too slow: 17.6% of your stock predates our
+  earliest sale record, and the stones that entered *and sold* in that same old
+  period are not in the records at all. Keeping the survivors without their
+  successes inflates the number.
+
+So we use only stones that entered stock inside the window our records cover.
+On your book: sold-only says 42 days, all-stock says 75, **the correct figure is
+46**. The full velocity engine (Workstream B) goes further — intervals,
+own-vs-market separation, GMROI.
+
+## A.2 — One gap in spec #2, and it matters
+
+Your document sends: `certificateNo`, `reason`, `aiDiscount`.
+
+**It does not include the desk's own price.** Without it we record *that* we were
+wrong but never *what right looks like* — there is no number to learn from, so
+the reason can only ever be analytics.
+
+Please add **`deskDiscount`** (your discount off Rap, e.g. `-48.0`) — or
+`deskPpc` with the stone's Rap. The endpoint accepts it today and the response
+tells you which you got:
+
+```json
+{ "recorded": true, "trainable": true, "variance_pts": 4.22,
+  "threshold_pts": 2.0, "needs_attention": true }
+```
+
+`"trainable": false` means we stored the reason but the model learned nothing.
+
+## A.3 — Master Discount AI
+
+Prices a **cell**, not a stone: you send a weight range, we answer at its midpoint
+and return the market support behind it, so a thinly-supported cell never reads
+like a well-supported one.
+
+## A.4 — What we still need from you
+
+1. **The server** (section 5.1) — the one real blocker.
+2. **`deskDiscount` added to spec #2** (A.2 above).
+3. If you want a real `AIScore`: enquiry/offer/video-view events, with which
+   customer, per stone.

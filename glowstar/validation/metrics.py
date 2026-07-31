@@ -13,6 +13,7 @@ class Metrics:
     n: int
     mae: float            # mean abs error, discount points
     medae: float          # median abs error, discount points
+    within2: float        # share within +/-2 discount points (the MOU 4.3 measure)
     within3: float        # share within +/-3 discount points
     within5: float        # share within +/-5 discount points
     dollar_medae: float   # median abs error per stone, USD
@@ -22,11 +23,19 @@ class Metrics:
         return asdict(self)
 
 
-def discount_metrics(pred: np.ndarray, actual: np.ndarray) -> tuple[float, float, float, float]:
+def discount_metrics(
+    pred: np.ndarray, actual: np.ndarray
+) -> tuple[float, float, float, float, float]:
+    """(mae, medae, within2, within3, within5) in discount points.
+
+    within2 is the band the MOU (4.3, measure 1) commits to reporting; it is the
+    tightest of the three and the one the desk grades us on.
+    """
     err = np.abs(pred - actual)
     return (
         float(np.mean(err)),
         float(np.median(err)),
+        float(np.mean(err <= 2.0)),
         float(np.mean(err <= 3.0)),
         float(np.mean(err <= 5.0)),
     )
@@ -47,10 +56,10 @@ def dollar_errors(pred_disc: np.ndarray, df: pd.DataFrame) -> tuple[float, float
 
 def compute(pred_disc: np.ndarray, df: pd.DataFrame, target: str = "FDiscount") -> Metrics:
     actual = df[target].to_numpy()
-    mae, medae, w3, w5 = discount_metrics(pred_disc, actual)
+    mae, medae, w2, w3, w5 = discount_metrics(pred_disc, actual)
     d_med, d_mean = dollar_errors(pred_disc, df)
     return Metrics(
-        n=len(df), mae=mae, medae=medae, within3=w3, within5=w5,
+        n=len(df), mae=mae, medae=medae, within2=w2, within3=w3, within5=w5,
         dollar_medae=d_med, dollar_mae=d_mean,
     )
 
