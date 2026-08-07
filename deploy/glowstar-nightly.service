@@ -1,0 +1,17 @@
+# Nightly: refresh live data, retrain, gate, prune. Paired with the .timer.
+[Unit]
+Description=GlowStar nightly snapshot + retrain
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=glowstar
+WorkingDirectory=/opt/glowstar
+EnvironmentFile=/opt/glowstar/.env
+# Order matters: snapshot first (it banks the grid history the retrain trains
+# on), then retrain. A snapshot failure must not skip the retrain, so they are
+# separate commands and the unit continues past a non-zero snapshot.
+ExecStart=-/opt/glowstar/.venv/bin/python -m glowstar.ingestion.run_snapshot
+ExecStart=/opt/glowstar/.venv/bin/python -m glowstar.training.retrain
+ExecStart=/opt/glowstar/deploy/backup.sh
+TimeoutStartSec=4h

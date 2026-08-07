@@ -1,0 +1,25 @@
+# Live pricing API. Install: /etc/systemd/system/glowstar-api.service
+#   sudo systemctl enable --now glowstar-api
+[Unit]
+Description=GlowStar Pricing API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=glowstar
+WorkingDirectory=/opt/glowstar
+EnvironmentFile=/opt/glowstar/.env
+# 2 workers: the model is held in memory per worker (~1GB each), so more workers
+# cost RAM without helping — this workload is model-bound, not request-bound.
+ExecStart=/opt/glowstar/.venv/bin/uvicorn glowstar.service.app:app \
+          --host 0.0.0.0 --port 8000 --workers 2 --timeout-keep-alive 65
+Restart=always
+RestartSec=10
+# The nightly retrain is the memory peak; leave the API room to survive it.
+MemoryMax=6G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

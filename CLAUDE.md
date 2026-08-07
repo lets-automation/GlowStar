@@ -175,6 +175,34 @@ feature and the report shows cell age — keep both.
 
 ---
 
+### 9. Canonicalise at EVERY entry point, not just the convenient one
+The engine routes on **exact-string lookups** against the vocabulary it was
+trained on (`Shape_full` = `"Round"`, `CPS` = `"3EX"`). The client's systems send
+trade codes: `RBC`/`OB`/`PB`/`MB`, and `EX-EX-EX`/`EX EX EX`.
+
+`reporting/price_file.py` converted them, so every Excel file ever sent was fine.
+`service/pricing_service.py` did **not** — so the brand-new API, the path the CRM
+was about to call, silently degraded: an unknown shape matched 0 training rows,
+was flagged `rare_shape` and fell to the sparse fallback. Measured on 250 real
+stones: **98% affected, mean 3.6 pts, 28% >=5 pts.** One triple-excellent stone
+priced three ways depending only on punctuation, and `EX EX EX` was read as *no
+cut data at all*.
+
+This is Trap 5 wearing different clothes: **the convenient path was correct and
+the shipping path was not.** Nothing failed loudly — `/health` returned 200 and
+the prices looked plausible.
+
+Fixed with `normalize_shape()` / `normalize_cps()` in `reference/normalize.py`
+(one shared table, imported by the Excel path too) as validators on `StoneIn`,
+the single boundary every API caller crosses. Guarded by the tests in
+`test_pricing_invariants.py`.
+
+**Rule: when you add an entry point, price the SAME stone through the old and the
+new path and assert they agree.** And never accept `/health` as evidence that
+pricing works — ask it for an actual price.
+
+---
+
 ## Data rules
 
 - **LIVE for everything.** Never price or train from static/sample files. A static

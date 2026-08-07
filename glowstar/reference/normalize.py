@@ -9,6 +9,7 @@ documented rules, never silent guesses (brief Sections 2, 5, 7.2).
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 # --- Clarity ---------------------------------------------------------------
@@ -90,6 +91,117 @@ def grid_for_shape(shape_code: str | None, shape_full: str | None) -> RapGrid:
         if token and token.strip().upper() in _ROUND_TOKENS:
             return RapGrid.ROUND
     return RapGrid.FANCY
+
+
+# Trade shape codes / spellings -> the exact `Shape_full` the engine trains on.
+#
+# MUST BE IDEMPOTENT, exactly like FLUOR_CANON below: every canonical OUTPUT is
+# also a key, so passing an already-canonical value through is a no-op.
+#
+# WHY THIS LIVES HERE AND NOT IN reporting/
+# ----------------------------------------
+# This map existed only in `reporting/price_file.py`, so the EXCEL path
+# canonicalised shapes and the API path did not. The engine routes on a raw dict
+# lookup (`_shape_counts.get(row["Shape_full"])`), and the client's own inventory
+# API sends CODES — `RBC`, `OB`, `PB`, `MB` — never `"Round"`. So a stone the
+# desk calls RBC scored 0 training rows, was flagged `rare_shape`, and dropped to
+# the sparse-data fallback: measured -57.58 instead of -51.44 on a 1.01 G VS1,
+# **6.1 points deeper**, on the single most common stone there is.
+#
+# The Excel files we have been sending were fine. The endpoint the CRM is about
+# to call was not. Canonicalise at every entry point, from one table.
+_SHAPE_FULL: dict[str, str] = {
+    "ROUND": "Round", "RBC": "Round", "RB": "Round", "BR": "Round", "RD": "Round",
+    "BRILLIANT": "Round", "ROUND BRILLIANT": "Round",
+    "OVAL": "Oval", "OB": "Oval", "OV": "Oval", "S.OV": "Oval", "SOV": "Oval",
+    "F.OVAL": "Oval",
+    "PEAR": "Pear", "PB": "Pear", "PS": "Pear", "PMB": "Pear",
+    "MARQUISE": "Marquise", "MB": "Marquise", "MQ": "Marquise",
+    "HEART": "Heart", "HB": "Heart", "HS": "Heart",
+    "EMERALD": "Emerald", "EM": "Emerald", "EB": "Emerald", "EC": "Emerald",
+    "PRINCESS": "Princess", "PR": "Princess", "SMB": "Princess",
+    "CUSHION": "Cushion", "CB": "Cushion", "CU": "Cushion", "CMB": "Cushion",
+    "RADIANT": "Radiant", "CCRMB": "Radiant", "RA": "Radiant", "CCSMB": "Radiant",
+    "RMB": "Radiant",
+    "SQ. EMERALD": "Sq. Emerald", "SQ.EMERALD": "Sq. Emerald",
+    "SQ EMERALD": "Sq. Emerald", "SQEM": "Sq. Emerald", "SEM": "Sq. Emerald",
+    "SE": "Sq. Emerald",
+}
+
+
+# --- Cut / Polish / Symmetry (CPS) -----------------------------------------
+
+# The model learned the cut effect from a SMALL closed vocabulary: 3EX, EX, VG,
+# GD, FR, PR (see reporting/price_file._make_cps, which produces exactly these).
+# Any other spelling is a category it has never seen.
+#
+# The client has already caught a CPS-vocabulary bug once. This is the same bug
+# on the new API path: `/price` accepts CPS as a free string, so three spellings
+# of the SAME triple-excellent stone returned three different prices —
+#   "3EX"      -> -45.85   (the trained form: correct)
+#   "EX-EX-EX" -> -51.44
+#   "EX EX EX" -> -59.54   (identical to sending NO cut data at all)
+# a 13.7-point spread on one stone, decided purely by punctuation.
+_CPS_GRADE: dict[str, str] = {
+    "EXCELLENT": "EX", "EX": "EX", "IDEAL": "EX", "ID": "EX", "X": "EX",
+    "VERY GOOD": "VG", "VERYGOOD": "VG", "VG": "VG", "V.GOOD": "VG",
+    "GOOD": "GD", "GD": "GD", "G": "GD",
+    "FAIR": "FR", "FR": "FR", "F": "FR",
+    "POOR": "PR", "PR": "PR", "P": "PR",
+}
+
+# Whole-string spellings of triple-excellent that carry no separators to split on.
+_TRIPLE_EX = {"3EX", "3X", "XXX", "EXEXEX", "TRIPLEEX", "TRIPLEEXCELLENT", "3EXCELLENT"}
+
+
+def normalize_cps(raw: str | None) -> str:
+    """Canonicalise a cut/polish/symmetry code to the trained vocabulary.
+
+    Accepts the separated forms a CRM is likely to send ("EX-EX-EX", "EX EX EX",
+    "EX/EX/EX", "VG-EX-EX") as well as the already-canonical codes.
+
+    Mirrors `_make_cps`: all three excellent -> "3EX", otherwise the CUT grade
+    (the first component), because that is what the model was trained on.
+    Unknown input returns "NA" — the honest "no cut information" value — rather
+    than a guess, since guessing high is exactly how a VG stone gets priced
+    like a 3EX.
+
+    MUST BE IDEMPOTENT: every output ("3EX", "EX", "VG", "GD", "FR", "PR", "NA")
+    is itself accepted and returned unchanged.
+    """
+    if raw is None:
+        return "NA"
+    s = str(raw).strip().upper()
+    if not s or s in {"NAN", "NONE", "NA", "N/A", "-"}:
+        return "NA"
+    if s.replace(" ", "").replace("-", "").replace("/", "") in _TRIPLE_EX:
+        return "3EX"
+    if s in _CPS_GRADE:
+        return _CPS_GRADE[s]
+    # Separated forms: EX-EX-EX, EX EX EX, EX/EX/EX, VG-EX-EX, ...
+    parts = [p for p in re.split(r"[-/,\s]+", s) if p]
+    grades = [_CPS_GRADE.get(p) for p in parts]
+    if grades and all(g is not None for g in grades):
+        if len(grades) >= 3 and all(g == "EX" for g in grades[:3]):
+            return "3EX"
+        return grades[0]        # the cut grade — what the model knows
+    return "NA"
+
+
+def normalize_shape(raw: str | None) -> str | None:
+    """Canonicalise a shape code or spelling to the engine's `Shape_full`.
+
+    Unknown shapes are passed through TITLE-CASED rather than forced to a
+    default: the client genuinely trades shapes outside this table, and silently
+    relabelling one as Round would be far worse than routing it as rare — which
+    is the honest answer for a shape we have no history on.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    return _SHAPE_FULL.get(s.upper(), s.title())
 
 
 # --- Fluorescence ----------------------------------------------------------

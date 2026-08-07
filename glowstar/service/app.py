@@ -31,11 +31,12 @@ import logging
 import os
 
 try:
-    from fastapi import Depends, FastAPI, Header, HTTPException
+    from fastapi import Depends, FastAPI, Header, HTTPException, Request
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover - server is optional
     FastAPI = None
 
+from . import ratelimit
 from .pricing_service import PricingService, StoneIn
 from .frontoffice import (FrontOfficeStone, FrontOfficeReason,
                           MasterDiscountRequest)
@@ -104,16 +105,38 @@ if FastAPI is not None:
             _service = PricingService()
         return _service
 
-    def require_key(x_api_key: str = Header(default="")) -> None:
-        """Shared-secret check. Set GS_API_KEY in the environment to enable it.
+    def require_key(request: Request, x_api_key: str = Header(default="")) -> None:
+        """Shared-secret check, then a rate limit. Attached to every priced route.
 
-        Unset = open, which is fine on a private network but must NOT be how this
-        is exposed to anything routable. The server refuses to start unprotected
-        in production (see `_startup`).
+        Set GS_API_KEY in the environment to enable the key check. Unset = open,
+        which is fine on a private network but must NOT be how this is exposed to
+        anything routable. The server refuses to start unprotected in production
+        (see `_startup`).
+
+        The rate limit runs AFTER the key check on purpose: a caller with a bad
+        key should not be able to consume a legitimate caller's allowance, and
+        rejecting on the key first is the cheaper of the two.
+
+        `/health` does not depend on this — a monitor must be able to probe
+        liveness without spending quota, and it exposes nothing.
         """
         expected = os.environ.get("GS_API_KEY", "")
         if expected and x_api_key != expected:
             raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
+
+        # Per key AND per source address: one runaway CRM instance must not
+        # starve the desk's other machines sharing the same key.
+        client = request.client.host if request.client else "-"
+        caller = f"{x_api_key[:8]}|{request.headers.get('x-real-ip') or client}"
+        ok, remaining, retry_after = ratelimit.check(caller)
+        if not ok:
+            log.warning("rate limit hit by %s — retry in %.0fs", caller, retry_after)
+            raise HTTPException(
+                status_code=429,
+                detail=f"rate limit exceeded; retry in {retry_after:.0f}s",
+                headers={"Retry-After": str(max(1, int(retry_after + 0.999)))},
+            )
+        request.state.rate_remaining = remaining
 
     @app.get("/health")
     def health() -> dict:
@@ -141,6 +164,16 @@ if FastAPI is not None:
         except OSError:
             out["status"] = "degraded"
             out["records_age_hours"] = None
+        # Surface the store: an API that is "ok" while silently failing to record
+        # anything is the failure mode this whole layer exists to prevent.
+        try:
+            from ..store import db
+            out["store"] = db.counts()
+            if "error" in out["store"]:
+                out["status"] = "degraded"
+        except Exception as e:
+            out["status"] = "degraded"
+            out["store"] = {"error": type(e).__name__}
         return out
 
     @app.post("/price", dependencies=[Depends(require_key)])

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the GlowStar nightly job
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+# If the machine was down at 02:30, run on boot rather than skip a day — a
+# missed night means a stale grid, and grid freshness is the single biggest
+# accuracy lever we have measured (fresh cell 1.5 MAE vs 4.3 when 2 weeks old).
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

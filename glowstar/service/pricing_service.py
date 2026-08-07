@@ -11,7 +11,7 @@ import logging
 from dataclasses import asdict
 
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..data.loaders import load_records, sold_stones
 from ..models.engine import PricingEngine, EngineConfig
@@ -38,6 +38,9 @@ class StoneIn(BaseModel):
     """
 
     StoneId: str = ""
+    # Canonicalised on the way IN — see the validator below. This is the single
+    # boundary every API caller crosses (/price, /price/batch and the FrontOffice
+    # endpoints all build a StoneIn), so fixing it here fixes all of them at once.
     Shape_full: str
     Weight: float = Field(gt=0)
     Color: str
@@ -70,6 +73,34 @@ class StoneIn(BaseModel):
     Green: str | None = None
     # Legacy aliases kept so an older caller does not break.
     milky: str | None = None
+
+    @field_validator("Shape_full")
+    @classmethod
+    def _canon_shape(cls, v: str) -> str:
+        """Accept the trade code the client's systems actually send.
+
+        Their inventory API sends `RBC` / `OB` / `PB` / `MB`, and a CRM field may
+        arrive as `ROUND` or `round`. The engine routes on an exact-string lookup
+        against `Shape_full` as TRAINED ("Round"), so anything else scored zero
+        training rows, was flagged `rare_shape` and fell to the sparse fallback —
+        6.1 points deeper on a 1.01 G VS1. Verified end-to-end over HTTP, not
+        reasoned about.
+        """
+        from ..reference.normalize import normalize_shape
+        return normalize_shape(v) or v
+
+    @field_validator("CPS")
+    @classmethod
+    def _canon_cps(cls, v: str) -> str:
+        """Same defect as the shape field, on cut/polish/symmetry.
+
+        The model's cut vocabulary is closed (3EX/EX/VG/GD/FR/PR). This endpoint
+        took CPS as a free string, so "3EX", "EX-EX-EX" and "EX EX EX" — one
+        stone, three spellings — returned -45.85, -51.44 and -59.54. The last is
+        what you get for sending no cut information at all.
+        """
+        from ..reference.normalize import normalize_cps
+        return normalize_cps(v)
 
 
 class PricingService:

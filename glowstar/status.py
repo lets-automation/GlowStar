@@ -127,6 +127,14 @@ def main() -> None:
     except Exception as e:
         print(f"feedback      : unreadable ({type(e).__name__})")
 
+    # --- durable store (quotes / decisions / scores) ---
+    try:
+        from .store import db
+        print(f"store         : {db.database_url().split('@')[-1]}")
+        print(f"  rows        : {db.counts()}")
+    except Exception as e:
+        print(f"store         : unavailable ({type(e).__name__})")
+
     # --- is feedback ready to train on yet? (measured, not remembered) ---
     try:
         from .feedback.readiness import format_report

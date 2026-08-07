@@ -409,3 +409,105 @@ def test_attach_grid_without_history_is_a_safe_noop():
                         "OrderDate_dt": pd.Timestamp("2026-06-15")}])
     out = attach_grid(df, None)
     assert out["grid_discount"].isna().all()      # engine still runs, just unrouted
+
+
+# --- shape canonicalisation on the SERVING path -----------------------------
+# The client's inventory API sends trade CODES (RBC/OB/PB/MB), never "Round".
+# The engine routes on an exact-string lookup against Shape_full as trained, so
+# an un-canonicalised code scored 0 training rows, was flagged `rare_shape` and
+# dropped to the sparse fallback: -57.58 vs -51.44 on a 1.01 G VS1. The Excel
+# path normalised; the API path did not.
+
+def test_shape_codes_canonicalise_to_trained_names():
+    from glowstar.reference.normalize import normalize_shape
+    for raw, want in [("RBC", "Round"), ("ROUND", "Round"), ("round", "Round"),
+                      ("BR", "Round"), ("OB", "Oval"), ("F.OVAL", "Oval"),
+                      ("PB", "Pear"), ("MB", "Marquise"), ("HB", "Heart"),
+                      ("EM", "Emerald"), ("CCRMB", "Radiant")]:
+        assert normalize_shape(raw) == want, f"{raw!r} -> {normalize_shape(raw)!r}"
+
+
+def test_normalize_shape_is_idempotent():
+    """Every canonical output must survive a second pass unchanged."""
+    from glowstar.reference.normalize import normalize_shape, _SHAPE_FULL
+    for canonical in set(_SHAPE_FULL.values()):
+        assert normalize_shape(canonical) == canonical, canonical
+
+
+def test_unknown_shape_is_not_silently_relabelled():
+    """A shape we have no history on must stay itself, not become a Round."""
+    from glowstar.reference.normalize import normalize_shape
+    assert normalize_shape("TRILLIANT") == "Trilliant"
+    assert normalize_shape("") is None and normalize_shape(None) is None
+
+
+def test_stone_in_canonicalises_shape_at_the_api_boundary():
+    """The fix must live on the boundary EVERY API caller crosses."""
+    from glowstar.service.pricing_service import StoneIn
+    for raw in ("RBC", "ROUND", "round", "BR"):
+        s = StoneIn(Shape_full=raw, Weight=1.01, Color="G", Clarity="VS1")
+        assert s.Shape_full == "Round", f"{raw!r} reached the engine as {s.Shape_full!r}"
+
+
+def test_excel_and_api_paths_share_one_shape_table():
+    """Two copies of this table is exactly how the paths drifted apart."""
+    from glowstar.reporting.price_file import _LIST_SHAPE
+    from glowstar.reference.normalize import _SHAPE_FULL
+    assert _LIST_SHAPE is _SHAPE_FULL
+
+
+# --- deployment artefacts must be Linux-parseable ---------------------------
+
+def test_deploy_files_have_unix_line_endings():
+    """CRLF in a shell script or systemd unit is a hard failure on the server.
+
+    Real error from a real run, after install.sh was edited on Windows:
+        install.sh: line 55: syntax error near unexpected token `$'do\r''
+    systemd units fail the same way — the trailing \r becomes part of the last
+    field's value, so ExecStart points at a binary that does not exist. This is
+    completely invisible on Windows, which is exactly why it needs a test.
+    """
+    from pathlib import Path
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    if not deploy.is_dir():
+        return
+    offenders = [p.name for p in sorted(deploy.iterdir())
+                 if p.is_file() and p.suffix in {".sh", ".service", ".timer", ".conf"}
+                 and b"\r\n" in p.read_bytes()]
+    assert not offenders, f"CRLF line endings in: {offenders} (see .gitattributes)"
+
+
+# --- CPS canonicalisation on the SERVING path -------------------------------
+# The client already caught a CPS-vocabulary bug once. This is the same defect
+# on the new API path: CPS arrived as a free string, so one stone spelled three
+# ways returned -45.85 / -51.44 / -59.54 — a 13.7pt spread decided by punctuation.
+
+def test_all_spellings_of_triple_excellent_agree():
+    from glowstar.reference.normalize import normalize_cps
+    for raw in ["3EX", "3X", "XXX", "EX-EX-EX", "EX EX EX", "ex/ex/ex",
+                "Excellent-Excellent-Excellent", "triple ex"]:
+        assert normalize_cps(raw) == "3EX", f"{raw!r} -> {normalize_cps(raw)!r}"
+
+
+def test_cps_keeps_a_lesser_make_lesser():
+    """A VG stone must NOT canonicalise to 3EX — that is how it gets overpriced."""
+    from glowstar.reference.normalize import normalize_cps
+    assert normalize_cps("VG-EX-EX") == "VG"
+    assert normalize_cps("Very Good") == "VG"
+    assert normalize_cps("GD") == "GD"
+
+
+def test_normalize_cps_is_idempotent_and_fails_to_NA():
+    from glowstar.reference.normalize import normalize_cps
+    for canonical in ("3EX", "EX", "VG", "GD", "FR", "PR", "NA"):
+        assert normalize_cps(canonical) == canonical, canonical
+    # Unknown input must become "no cut information", never a flattering guess.
+    for junk in (None, "", "   ", "nan", "wibble", "-"):
+        assert normalize_cps(junk) == "NA", repr(junk)
+
+
+def test_stone_in_canonicalises_cps_at_the_api_boundary():
+    from glowstar.service.pricing_service import StoneIn
+    for raw in ("EX-EX-EX", "EX EX EX", "3X"):
+        s = StoneIn(Shape_full="RBC", Weight=1.01, Color="G", Clarity="VS1", CPS=raw)
+        assert s.CPS == "3EX", f"{raw!r} reached the engine as {s.CPS!r}"

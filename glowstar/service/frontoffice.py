@@ -236,9 +236,16 @@ def price_stones(stones: list[FrontOfficeStone], service) -> list[dict]:
         row: dict[str, Any] = {"StoneId": fo.stoneId,
                                "CertificateNo": fo.certificateNo}
         try:
-            res = service.price(to_stone_in(fo))
+            stone = to_stone_in(fo)
+            res = service.price(stone)
             f = res["suggestion"]
-            trade = tradeability_for(fo.shape, fo.weight, fo.color, fo.clarity)
+            # Use the CANONICALISED shape (StoneIn normalises it), not the raw
+            # `fo.shape`: the client sends codes like RBC/OB, and the segment
+            # tables are keyed by the trained name. Passing the raw code here
+            # silently found no segment and cost the stone its tradeability and
+            # Liquidity/MarketStrength scores.
+            shape = stone.Shape_full
+            trade = tradeability_for(shape, fo.weight, fo.color, fo.clarity)
             conf = _confidence_score(f)
             # `days` / `availableDays` is how long THIS stone has been in stock —
             # the only per-stone input the Urgency score has.
@@ -247,7 +254,7 @@ def price_stones(stones: list[FrontOfficeStone], service) -> list[dict]:
                 our_discount=f["suggested_discount"],
                 market_discount=f.get("market_median_discount"),
                 market_depth=f.get("comparable_count"),
-                own_sales=segment_sales_count(fo.shape, fo.color, fo.clarity),
+                own_sales=segment_sales_count(shape, fo.color, fo.clarity),
                 median_days=trade["median_days"],
                 age_days=(float(age) if age is not None else None),
                 confidence=conf,
@@ -272,6 +279,9 @@ def price_stones(stones: list[FrontOfficeStone], service) -> list[dict]:
                 # their spec names the headline field "AI Score"
                 "AIScore": scores["FinalAIScore"],
             })
+            # Durable audit + the evidence needed to refit the score weights.
+            # Best-effort by design: a store outage must never cost a price.
+            _persist(fo, f, scores, trade, service)
             unused = _unused_fields(fo)
             if unused:
                 row["ReceivedNotYetPriced"] = unused
@@ -283,6 +293,42 @@ def price_stones(stones: list[FrontOfficeStone], service) -> list[dict]:
                         "Error": f"{type(e).__name__}: {e}"})
         out.append(row)
     return out
+
+
+def model_version(service) -> str | None:
+    """Which model produced this price — the audit trail's whole point.
+
+    Read from the registry rather than from the service object: the service holds
+    a loaded engine, not its card, and a quote row that cannot name the model that
+    made it is not an audit record. Cached on the service after the first lookup.
+    """
+    cached = getattr(service, "_model_version_cache", None)
+    if cached is not None:
+        return cached or None
+    v = None
+    try:
+        from ..models import registry
+        v = registry.current_version()
+    except Exception:
+        log.exception("could not resolve the live model version")
+    try:
+        service._model_version_cache = v or ""
+    except Exception:
+        pass                      # a read-only/mock service: just skip the cache
+    return v
+
+
+def _persist(fo, facts: dict, scores: dict, trade: dict, service) -> None:
+    """Record the quote and its scores. Never raises — see store/db.py."""
+    try:
+        from ..store import db
+        mv = model_version(service)
+        db.record_quote(facts=facts, stone=fo.model_dump(), model_version=mv,
+                        source="frontoffice")
+        db.record_scores(stone_id=fo.stoneId, s=scores, tradeability=trade,
+                         model_version=mv)
+    except Exception:
+        log.exception("could not persist quote/scores for %s", fo.stoneId)
 
 
 def _reason_text(res: dict, facts: dict) -> str:

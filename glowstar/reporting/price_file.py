@@ -107,20 +107,12 @@ def parse_gia_export(path: str | Path) -> pd.DataFrame:
 # Stone-list shape codes -> engine Shape_full. Covers the client's trade
 # abbreviations (RBC=Round, OB=Oval Brilliant, MB=Marquise, PB=Pear, HB=Heart,
 # CCRMB=Cut-Cornered Rect. Modified Brilliant=Radiant, SQEM=Square Emerald, ...).
-_LIST_SHAPE = {
-    "ROUND": "Round", "RBC": "Round", "RB": "Round", "BR": "Round", "RD": "Round",
-    "OVAL": "Oval", "OB": "Oval", "OV": "Oval", "S.OV": "Oval", "SOV": "Oval",
-    "PEAR": "Pear", "PB": "Pear", "PS": "Pear", "PMB": "Pear",
-    "MARQUISE": "Marquise", "MB": "Marquise", "MQ": "Marquise",
-    "HEART": "Heart", "HB": "Heart", "HS": "Heart",
-    "EMERALD": "Emerald", "EM": "Emerald", "EB": "Emerald", "EC": "Emerald",
-    "PRINCESS": "Princess", "PR": "Princess", "SMB": "Princess",
-    "CUSHION": "Cushion", "CB": "Cushion", "CU": "Cushion", "CMB": "Cushion",
-    "RADIANT": "Radiant", "CCRMB": "Radiant", "RA": "Radiant", "CCSMB": "Radiant",
-    "RMB": "Radiant",
-    "SQ.EMERALD": "Sq. Emerald", "SQ EMERALD": "Sq. Emerald", "SQEM": "Sq. Emerald",
-    "SEM": "Sq. Emerald", "SE": "Sq. Emerald",
-}
+#
+# The table now lives in `reference/normalize.py` and is shared with the API
+# path. It was defined only here, so Excel files got canonical shapes and live
+# API callers did not — and the engine's routing is an exact-string lookup.
+# One table, every entry point.
+from ..reference.normalize import _SHAPE_FULL as _LIST_SHAPE
 
 
 def _first_col(cols: set, *names: str) -> str | None:

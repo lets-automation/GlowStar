@@ -130,6 +130,17 @@ def record(fb: FeedbackRecord, path: Path | None = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(asdict(fb)) + "\n")
+    # Mirror into the durable store. The JSONL stays the training pipeline's
+    # source (unchanged, works offline); the database is the system of record for
+    # concurrent live writes and for querying history — an append-only text file
+    # has no transaction, and the CRM and the nightly job will write at once.
+    try:
+        from ..store import db
+        db.record_decision(rec=asdict(fb), variance=fb.variance,
+                           needs_attention=fb.needs_attention,
+                           trainable=fb.human_discount is not None)
+    except Exception:
+        log.exception("decision written to JSONL but NOT to the store")
     log.info("Recorded %s for stone %s (reason=%s)", fb.decision, fb.stone_id, fb.reason_code)
     return p
 
