@@ -2,7 +2,50 @@
 
 **For:** Glow Star IT (Jay Bhai)
 **From:** Lets Automation
-**Covers:** what your software sends us, what it gets back, what server is needed.
+**Covers:** what your software sends us, and what it gets back.
+
+---
+
+## 0. The service is LIVE — connection details
+
+The server is built and the engine is running. You can start integrating today.
+
+| | |
+|---|---|
+| **Base URL (testing)** | `http://217.217.248.111:8000` |
+| **Base URL (go-live)** | An `https://…` address — **will change, see below** |
+| **Authentication** | Header `X-API-Key: <the key we send you separately>` |
+| **Format** | JSON in, JSON out (`Content-Type: application/json`) |
+| **Rate limit** | 120 requests/minute. Over that returns `429` with a `Retry-After` header. Far above normal desk use — it only triggers on a runaway loop. |
+| **Max batch** | 5,000 stones per call (larger returns `413`) |
+
+> ⚠️ **Please put the base URL in a configuration setting, not hardcoded.**
+> The address above is plain HTTP for integration testing. Before your desk uses
+> this for real prices we will move it to a proper `https://` address, and the
+> only thing that should need to change on your side is one config value.
+
+**Quick test** — this should return a price:
+
+```bash
+curl -X POST http://217.217.248.111:8000/price \
+  -H "X-API-Key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"Shape_full":"ROUND","Weight":1.01,"Color":"G","Clarity":"VS1"}'
+```
+
+### Codes: send us whatever your system already uses
+
+You do **not** need to translate anything. We accept your trade codes and
+normalise them at our end:
+
+| Field | All of these work |
+|---|---|
+| Shape | `RBC`, `ROUND`, `Round`, `round`, `BR` → Round. Likewise `OB`/`OVAL`, `PB`/`PEAR`, `MB`/`MARQUISE`, `HB`/`HEART`, `EM`/`EMERALD`, `CCRMB`/`RADIANT` |
+| Cut/Polish/Symmetry | `3EX`, `EX-EX-EX`, `EX EX EX`, `EX/EX/EX` all mean the same thing |
+| Fluorescence | `NON`/`None`, `FNT`/`Faint`, `MED`/`Medium`, `STG`/`Strong`, `VSTG`/`Very Strong` |
+
+Send whichever form your inventory already holds. Sending an unknown shape is
+safe — the stone is flagged for review rather than silently mispriced.
 
 ---
 
@@ -181,27 +224,18 @@ stopped.
 
 ## 5. What we need from you
 
-### 5.1 A server
+### 5.1 A server — DONE
 
-One Linux virtual machine that is **always on**.
-
-| | |
-|---|---|
-| Where | Azure, same region as your inventory API (fastest, simplest) |
-| Size | 4 vCPU, 16 GB RAM, 256 GB disk |
-| OS | Ubuntu 22.04 LTS |
-| Cost | roughly $70–110 / month |
-| Access | SSH for our team |
-| Open ports | 443 inbound (your CRM → us) |
+The server is built, secured and running (Ubuntu 24.04, Mumbai, always on). The
+price service, the nightly retrain and the daily data pulls all run on it. There
+is no separate "model server". **Nothing further is needed from you here.**
 
 **Why always on matters — measured, not theoretical.** The engine refreshes your
-price grid every day. When that refresh is current, our error is **1.5 points**.
-When it is two weeks behind, the same engine is **4.3 points** out. Today these
-jobs run on a laptop that sleeps. Nothing improves accuracy more than a machine
-that simply never stops.
-
-The same machine runs everything — the price service, the nightly retrain, and
-the daily data pulls. There is no separate "model server".
+price grid every day. When that refresh is current our error is about **2
+points**; when it is two weeks behind, the same engine is about **3 points** out.
+The old setup ran on a laptop that slept and missed 10 nights in 23. The new
+machine simply never stops, and if it is ever restarted the missed job runs
+automatically as soon as it comes back.
 
 ### 5.2 Confirmations
 
