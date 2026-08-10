@@ -16,8 +16,17 @@ gzip -c /opt/glowstar/data/master_grid/history.json \
   > "$BACKUP_DIR/grid_history_$STAMP.json.gz"
 
 # 2. the database (quotes, decisions, scores)
+#
+# GS_DATABASE_URL is a SQLAlchemy URL and carries a DRIVER suffix:
+#     postgresql+psycopg://glowstar:pw@localhost/glowstar
+# `pg_dump` speaks libpq, which has no idea what "+psycopg" means — it treats
+# the whole string as a database NAME and fails with
+#     FATAL: database "postgresql+psycopg://..." does not exist
+# so the nightly dump would fail EVERY night while the grid backup beside it
+# succeeded. Strip the driver suffix to get a URL libpq understands.
 if [[ "${GS_DATABASE_URL:-}" == postgres* ]]; then
-  pg_dump "$GS_DATABASE_URL" | gzip > "$BACKUP_DIR/db_$STAMP.sql.gz"
+  PG_URL="$(printf '%s' "$GS_DATABASE_URL" | sed -E 's#^(postgresql|postgres)\+[a-z0-9_]+://#\1://#')"
+  pg_dump "$PG_URL" | gzip > "$BACKUP_DIR/db_$STAMP.sql.gz"
 else
   sqlite3 /opt/glowstar/data/glowstar.db ".backup '$BACKUP_DIR/db_$STAMP.db'"
 fi
@@ -29,9 +38,46 @@ cp /opt/glowstar/data/feedback/decisions.jsonl "$BACKUP_DIR/decisions_$STAMP.jso
 find "$BACKUP_DIR" -name '*.gz' -mtime +30 -delete
 find "$BACKUP_DIR" -name '*.db' -mtime +30 -delete
 
+# ---------------------------------------------------------------------------
 # OFF-SERVER copy. A backup on the same disk is not a backup.
-if [[ -n "${GS_BACKUP_AZURE_URL:-}" ]]; then
-  az storage blob upload-batch -d backups -s "$BACKUP_DIR" --overwrite \
-     --connection-string "$GS_BACKUP_AZURE_URL" >/dev/null
+#
+# Push-only by design: this server sends the files OUT to storage. Nothing ever
+# connects inward to us, and no firewall port is opened anywhere.
+#
+# Only TODAY's files are sent. The previous version re-uploaded the whole 30-day
+# directory every night — ~600 MB of pointless transfer for ~20 MB of new data.
+#
+# Prefer a destination at a DIFFERENT provider from the server itself. Backups
+# that share a provider with the thing they are protecting fail together.
+# ---------------------------------------------------------------------------
+today_files=("$BACKUP_DIR"/*"$STAMP"*)
+sent=""
+
+if [[ -n "${GS_BACKUP_RCLONE_REMOTE:-}" ]]; then
+  # Works with any S3-compatible or cloud store: Contabo Object Storage,
+  # Backblaze B2, AWS S3, Azure Blob, Google Cloud Storage.
+  # Configure once with `rclone config`, then set e.g.
+  #   GS_BACKUP_RCLONE_REMOTE=b2:glowstar-backups
+  rclone copy --no-traverse "${today_files[@]}" "$GS_BACKUP_RCLONE_REMOTE/" \
+    || { echo "OFF-SITE BACKUP FAILED (rclone) — local copy kept" >&2; exit 1; }
+  sent="$GS_BACKUP_RCLONE_REMOTE"
+
+elif [[ -n "${GS_BACKUP_AZURE_URL:-}" ]]; then
+  for f in "${today_files[@]}"; do
+    az storage blob upload -c backups -f "$f" -n "$(basename "$f")" --overwrite \
+       --connection-string "$GS_BACKUP_AZURE_URL" >/dev/null \
+      || { echo "OFF-SITE BACKUP FAILED (azure) — local copy kept" >&2; exit 1; }
+  done
+  sent="azure:backups"
 fi
+
+if [[ -z "$sent" ]]; then
+  # Loud, not silent. A backup that only exists on the machine being backed up
+  # is the failure mode people discover on the day they need it.
+  echo "WARNING: no off-site destination configured — set GS_BACKUP_RCLONE_REMOTE" >&2
+  echo "         or GS_BACKUP_AZURE_URL. Backups are LOCAL ONLY." >&2
+else
+  echo "off-site copy sent to $sent"
+fi
+
 echo "backup complete: $BACKUP_DIR ($STAMP)"

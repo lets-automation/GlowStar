@@ -17,6 +17,7 @@ Every number is computed here; the LLM layer only narrates these outputs.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -24,7 +25,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 from ..config import SETTINGS
-from ..features.build import build_features, get_target
+from ..features.build import build_features, get_target, TARGET
 from ..reference.normalize import is_white_grid_color
 from ..market.anchor import MarketTables, calibrate_offsets, anchor_predictions, market_series
 from ..market.index import MarketIndex
@@ -32,6 +33,15 @@ from ..market.bgm import assess as bgm_assess
 from ..feedback.learning import build_corrections, correction_for, as_training_examples
 from .baseline import HierarchicalMedianModel
 from .gbm import QuantileGBM
+
+# Module-level logger, deliberately named `log` rather than reaching for the
+# `logging` module inside methods. Several methods here do a local
+# `import logging`, which makes `logging` a LOCAL name for that whole function —
+# so any earlier reference to it in the same function raises
+# `UnboundLocalError: cannot access local variable 'logging'`. That is not
+# hypothetical: it took down the nightly retrain on 2026-08-10. A distinct
+# module-level name cannot be shadowed that way.
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -193,6 +203,32 @@ class PricingEngine:
         (durable learning) and OVERRIDEs build per-segment online corrections."""
         if self.tables is None:
             self.tables = MarketTables.load()
+
+        # DROP rows with no usable target, ONCE, before anything downstream sees
+        # them. The client's feed occasionally returns a sold stone with a
+        # missing FDiscount: on 2026-08-10 exactly ONE row out of 17,367 did,
+        # and it aborted the whole nightly retrain with
+        # `ValueError: Input y contains NaN` inside MarketIndex's Ridge.
+        #
+        # Fixing it only in MarketIndex would have moved the crash rather than
+        # removed it — HistGradientBoosting tolerates NaN in FEATURES but not in
+        # the TARGET, so the GBM was the next thing to fall over. Filter here so
+        # every downstream consumer (index, GBM, grid model, conformal, guard)
+        # is guaranteed a clean target.
+        #
+        # `errors="coerce"` matters: the feed sends the target as a string, so a
+        # non-numeric value must become NaN and be dropped rather than raise.
+        n_before = len(train)
+        train = train[pd.to_numeric(train[TARGET], errors="coerce").notna()]
+        dropped = n_before - len(train)
+        if dropped:
+            # WARNING, not silence: one row is a feed hiccup, hundreds is a
+            # broken feed, and the difference must be visible in the job log.
+            log.warning("fit: dropped %d/%d training rows with no usable %s",
+                        dropped, n_before, TARGET)
+        if train.empty:
+            raise ValueError(f"no training rows with a usable {TARGET}")
+
         feedback_records = feedback_records or []
         self.set_feedback(feedback_records)
 

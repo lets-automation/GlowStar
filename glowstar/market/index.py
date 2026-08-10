@@ -57,6 +57,26 @@ class MarketIndex:
     _encoder: OneHotEncoder = None
 
     def fit(self, sold: pd.DataFrame, recent_months: int = 3) -> "MarketIndex":
+        # DROP rows with no target before fitting. The client's feed occasionally
+        # returns a sold stone with a missing FDiscount — on 2026-08-10 it was
+        # exactly ONE row out of 17,367 — and Ridge refuses to fit on a NaN
+        # target with `ValueError: Input y contains NaN`. That single row took
+        # down the ENTIRE nightly retrain, which would then have failed silently
+        # every night while the API kept serving an ever-more-stale model.
+        #
+        # Same principle as `/price/batch`: one bad record must never cost the
+        # whole book. Log the count so a feed that starts degrading is visible
+        # rather than quietly discarded.
+        n_before = len(sold)
+        sold = sold[sold["FDiscount"].notna()]
+        dropped = n_before - len(sold)
+        if dropped:
+            log.warning("MarketIndex: dropped %d/%d sold rows with no FDiscount",
+                        dropped, n_before)
+        if sold.empty:
+            raise ValueError("no sold rows with a usable FDiscount — cannot fit "
+                             "the market index")
+
         self._encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
         x = _quality_design(sold, self._encoder, fit=True)
         y = sold["FDiscount"].to_numpy()

@@ -511,3 +511,72 @@ def test_stone_in_canonicalises_cps_at_the_api_boundary():
     for raw in ("EX-EX-EX", "EX EX EX", "3X"):
         s = StoneIn(Shape_full="RBC", Weight=1.01, Color="G", Clarity="VS1", CPS=raw)
         assert s.CPS == "3EX", f"{raw!r} reached the engine as {s.CPS!r}"
+
+
+# --- one bad row must not kill the retrain ---------------------------------
+# PRODUCTION FAILURE, 2026-08-10: exactly ONE sold row out of 17,367 came back
+# from the client's feed with no FDiscount. Ridge inside MarketIndex refused to
+# fit ("Input y contains NaN") and the ENTIRE nightly retrain aborted. The API
+# kept serving, so nothing looked broken — the model would simply have frozen,
+# silently, every night.
+
+def _sold_frame(n=60):
+    import numpy as np
+    rng = np.random.default_rng(0)
+    return pd.DataFrame({
+        "Shape_full": ["Round"] * n,
+        "Weight": rng.uniform(0.3, 2.0, n).round(2),
+        "Color": ["G"] * n, "Clarity": ["VS1"] * n,
+        "CPS": ["3EX"] * n, "Fluorescence": ["Non"] * n,
+        "Rap": rng.uniform(3000, 9000, n).round(0),
+        "FDiscount": rng.uniform(-60, -35, n).round(2),
+        "OrderDate_dt": pd.to_datetime("2026-06-01") + pd.to_timedelta(rng.integers(0, 120, n), "D"),
+        "MarketSheetDate_dt": pd.to_datetime("2026-06-01"),
+    })
+
+
+def test_market_index_survives_a_missing_target():
+    """The exact production crash: one NaN target must be dropped, not fatal."""
+    from glowstar.market.index import MarketIndex
+    df = _sold_frame()
+    df.loc[df.index[3], "FDiscount"] = float("nan")
+    idx = MarketIndex().fit(df)          # must NOT raise ValueError
+    assert idx.series is not None and len(idx.series) > 0
+
+
+def test_market_index_refuses_when_every_target_is_missing():
+    """Dropping bad rows must not silently become 'fit on nothing'."""
+    from glowstar.market.index import MarketIndex
+    df = _sold_frame()
+    df["FDiscount"] = float("nan")
+    with pytest.raises(ValueError, match="no sold rows"):
+        MarketIndex().fit(df)
+
+
+def test_engine_fit_survives_a_missing_target_end_to_end():
+    """ACTUALLY CALL fit() with a NaN target — do not just grep the source.
+
+    The first version of this test inspected the source for the filter and
+    PASSED WHILE THE CODE WAS BROKEN at runtime: the filter was present, but the
+    log line beside it raised `UnboundLocalError`, because several methods in
+    engine.py do a local `import logging` — which makes `logging` a local name
+    for the entire function. A source-grep test cannot catch that. This one runs
+    the code, which is the only thing that would have.
+    """
+    from glowstar.data.loaders import load_records, sold_stones
+    from glowstar.models.engine import PricingEngine, EngineConfig
+    from glowstar.config import SETTINGS
+    from glowstar.validation.backtest import time_split
+
+    df, _ = load_records()
+    sold = sold_stones(df, drop_outliers=True)
+    train, test, _ = time_split(sold, SETTINGS.backtest_split_date)
+    train = train.copy()
+    # Exactly the production shape: ONE unusable target among thousands.
+    train.iloc[0, train.columns.get_loc("FDiscount")] = float("nan")
+
+    eng = PricingEngine(EngineConfig(split_date=SETTINGS.backtest_split_date)).fit(train)
+    assert eng.gbm is not None, "the GBM must still have been fitted"
+    # And it must actually price afterwards, not merely survive fitting.
+    s = eng.predict(test.head(5))
+    assert len(s) == 5 and all(x.suggested_ppc > 0 for x in s)

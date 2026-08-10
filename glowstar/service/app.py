@@ -176,10 +176,34 @@ if FastAPI is not None:
             out["store"] = {"error": type(e).__name__}
         return out
 
+    def _audit(res: dict, stone: StoneIn, source: str) -> dict:
+        """Write the published price to the audit trail.
+
+        Every price we publish must be answerable later — "what did you quote in
+        March, and which model said it?" is the first question asked when a price
+        is disputed, and the MOU requires the trail. Only `/frontoffice/price`
+        recorded quotes; `/price` and `/price/batch` published prices that left
+        no record at all, so anything the desk priced through those endpoints was
+        invisible afterwards.
+
+        `record_quote` is best-effort and never raises (glowstar/store/db.py), so
+        a dead database costs an audit row, never the price itself.
+        """
+        try:
+            from ..store import db
+            from ..models import registry
+            db.record_quote(facts=res.get("suggestion", {}),
+                            stone=stone.model_dump(),
+                            model_version=registry.current_version(),
+                            source=source)
+        except Exception:
+            log.exception("audit write failed — the price was still served")
+        return res
+
     @app.post("/price", dependencies=[Depends(require_key)])
     def price(stone: StoneIn) -> dict:
         """Price one stone: suggestion, interval, comparables, flags, explanation."""
-        return _get_service().price(stone)
+        return _audit(_get_service().price(stone), stone, "api")
 
     @app.post("/price/batch", dependencies=[Depends(require_key)])
     def price_batch(stones: list[StoneIn]) -> dict:
@@ -194,7 +218,7 @@ if FastAPI is not None:
         priced, failed = [], []
         for s in stones:
             try:
-                priced.append(svc.price(s))
+                priced.append(_audit(svc.price(s), s, "api-batch"))
             except Exception as e:
                 log.exception("pricing failed for %s", s.StoneId)
                 failed.append({"stone_id": s.StoneId, "error": f"{type(e).__name__}: {e}"})

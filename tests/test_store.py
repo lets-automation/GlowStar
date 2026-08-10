@@ -171,3 +171,27 @@ def test_rate_limit_tracking_dict_is_bounded(monkeypatch):
     for i in range(ratelimit._MAX_TRACKED + 200):
         ratelimit.check(f"key-{i}", now=float(i))
     assert len(ratelimit._hits) <= ratelimit._MAX_TRACKED
+
+
+# --- audit trail on every published price ----------------------------------
+# Only /frontoffice/price recorded quotes. /price and /price/batch published
+# prices that left NO record, so anything priced through them was invisible
+# afterwards — and "what did you quote in March, and why?" is the first
+# question asked when a price is disputed (MOU audit requirement).
+
+def test_price_endpoints_are_wired_to_the_audit_trail():
+    import inspect
+    from glowstar.service import app as A
+    src = inspect.getsource(A)
+    assert "_audit(_get_service().price(stone)" in src, "/price does not audit"
+    assert '_audit(svc.price(s), s, "api-batch")' in src, "/price/batch does not audit"
+
+
+def test_audit_failure_never_costs_the_price(monkeypatch):
+    """A dead store must lose an audit row, never the quote."""
+    from glowstar.store import db
+    monkeypatch.setattr(db, "get_engine",
+                        lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+    # record_quote swallows everything internally; it must not raise.
+    db.record_quote(facts={"suggested_discount": -50.0}, stone={"StoneId": "X"},
+                    model_version="v1", source="api")

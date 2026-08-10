@@ -67,7 +67,7 @@ Run once, as root, on the new server: `bash deploy/install.sh`
 ```bash
 apt-get install -y python3 python3-venv python3-pip \
     postgresql postgresql-contrib nginx certbot python3-certbot-nginx \
-    sqlite3 git curl sudo gzip
+    sqlite3 git curl sudo gzip tzdata rclone
 ```
 
 | Package | Why |
@@ -79,6 +79,8 @@ apt-get install -y python3 python3-venv python3-pip \
 | `sqlite3` | Local backup format, diagnostics |
 | `git`, `curl` | Deployment and health checks |
 | `sudo`, `gzip` | Used by the script itself |
+| `tzdata` | Timezone data — the server must run on India time, see 4.2 |
+| `rclone` | Sends the nightly backup to off-site storage |
 
 Nothing else is installed. No Docker, no runtime we do not control.
 

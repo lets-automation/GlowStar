@@ -35,3 +35,8 @@ MOU.md
 UNI_BGMFILEDWITH.json
 response.json
 records.json
+deploy-bundle.tar.gz
+
+# Backups pulled DOWN from the server for safekeeping. Data, not source, and
+# large — belongs off-box, not in git.
+server-backups/
