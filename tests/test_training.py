@@ -82,3 +82,72 @@ def test_assemble_history_unions_and_dedupes(tmp_path, monkeypatch):
     assert set(sold["StoneId"]) == {"A", "B", "C", "D"}
     b = sold.loc[sold["StoneId"] == "B", "FDiscount"].iloc[0]
     assert b == -55                                          # keep="last" -> day-2 value
+
+
+# --- the promotion gate must not be a ratchet -------------------------------
+# OBSERVED IN PRODUCTION (2026-08-10/11): the first three models went
+# 2.469 -> 2.605 -> 2.815 and EVERY promotion was inside tolerance, because the
+# gate compared against the incumbent — which is replaced by each promotion, so
+# the bar rose with it. Projected forward that reaches MAE ~4.96 in ten nights
+# with every log line reading `promoted: True`.
+
+def test_gate_is_not_a_ratchet_replaying_real_production_numbers():
+    """Replay the real sequence, then let the same trend continue one more night.
+
+    Under the old incumbent-only rule EVERY night promoted, forever. Under the
+    new rule the drift from best-ever accumulates and the gate stops it. The
+    two observed nights are still allowed (they are inside the drift budget);
+    the third, which is where it would have become a genuine problem, is not.
+    """
+    from glowstar.training.retrain import gate_decision
+    observed = [2.469, 2.605, 2.815]
+    best = inc = observed[0]
+    for cand in observed[1:]:
+        ok, _ = gate_decision(cand, inc, best)
+        assert ok, f"{cand} is within budget and should still promote"
+        inc, best = cand, min(best, cand)
+
+    # The trend continued at the observed rate (~+0.21/night).
+    next_night = 3.025
+    ok, why = gate_decision(next_night, inc, best)
+    assert not ok, "the ratchet must stop — this is the whole point of the change"
+    assert "drifted" in why and str(best) in why
+
+
+def test_gate_bounds_total_drift_over_many_nights():
+    """The whole point: degradation must be bounded, not merely slowed."""
+    from glowstar.training.retrain import (gate_decision,
+                                           MAX_DRIFT_FROM_BEST_PTS,
+                                           PROMOTE_TOLERANCE_PTS)
+    best = inc = 2.5
+    for _ in range(50):                       # 50 nights of relentless creep
+        cand = round(inc + PROMOTE_TOLERANCE_PTS - 0.001, 3)
+        ok, _ = gate_decision(cand, inc, best)
+        if ok:
+            inc = cand
+            best = min(best, cand)
+    assert inc <= 2.5 + MAX_DRIFT_FROM_BEST_PTS + PROMOTE_TOLERANCE_PTS, \
+        f"MAE ratcheted to {inc} — drift is not bounded"
+
+
+def test_gate_absolute_ceiling_overrides_everything():
+    from glowstar.training.retrain import gate_decision, MAX_ACCEPTABLE_MAE
+    ok, why = gate_decision(MAX_ACCEPTABLE_MAE + 0.1, inc_mae=99.0, best_mae=99.0)
+    assert not ok and "ceiling" in why, "a catastrophic model must never ship"
+
+
+def test_gate_still_promotes_a_genuine_improvement():
+    """Anti-ratchet must not become anti-progress."""
+    from glowstar.training.retrain import gate_decision
+    ok, _ = gate_decision(2.0, inc_mae=2.6, best_mae=2.4)
+    assert ok, "a model better than the best ever must always promote"
+
+
+def test_best_mae_ignores_corrupt_cards(tmp_path, monkeypatch):
+    """A corrupt card must not break the nightly retrain."""
+    from glowstar.models import registry
+    monkeypatch.setattr(registry, "MODELS_DIR", tmp_path)
+    (tmp_path / "v1").mkdir(); (tmp_path / "v1" / "metrics.json").write_text('{"test_mae": 3.0}')
+    (tmp_path / "v2").mkdir(); (tmp_path / "v2" / "metrics.json").write_text('{"test_mae": 2.1}')
+    (tmp_path / "v3").mkdir(); (tmp_path / "v3" / "metrics.json").write_text('not json at all')
+    assert registry.best_mae() == 2.1

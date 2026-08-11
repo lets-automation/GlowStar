@@ -103,6 +103,35 @@ def load_current() -> tuple[object | None, dict | None]:
     return engine, card
 
 
+def best_mae() -> float | None:
+    """Lowest test MAE ever recorded across every saved model card.
+
+    The promotion gate needs a reference point that does NOT move upward. The
+    incumbent's MAE is not that: it is replaced by every promotion, so gating on
+    it alone is a ratchet that lets the model degrade without bound (see
+    `gate_decision`). The best ever achieved only ever moves down.
+
+    Reads the cards rather than the engines — cheap, and it still works for
+    versions whose engine file has since been pruned off disk.
+    """
+    best: float | None = None
+    if not MODELS_DIR.exists():
+        return None
+    for d in MODELS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        f = d / "metrics.json"
+        if not f.exists():
+            continue
+        try:
+            mae = json.loads(f.read_text(encoding="utf-8")).get("test_mae")
+        except Exception:      # a corrupt card must not break the retrain
+            continue
+        if isinstance(mae, (int, float)) and (best is None or mae < best):
+            best = float(mae)
+    return best
+
+
 def list_versions() -> list[str]:
     if not MODELS_DIR.exists():
         return []

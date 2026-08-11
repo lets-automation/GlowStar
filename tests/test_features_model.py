@@ -38,8 +38,23 @@ def test_leakage_guard_trips_on_forbidden_column():
 
 
 def test_target_is_fdiscount(sold):
+    """`get_target` returns FDiscount as float — including its gaps.
+
+    This used to assert `(y == sold["FDiscount"]).all()`, which quietly assumed
+    the target is never missing. That stopped being true: the client's feed
+    returns a small number of SOLD stones with no FDiscount (1 row in the
+    server's training split on 2026-08-11, 3 locally). Because `NaN != NaN`, the
+    old form fails the moment a single one appears — it was asserting a property
+    of the DATA, not of the function.
+
+    The missing values are real and are filtered at fit time (see
+    `PricingEngine.fit`), not here. So compare where values exist, and assert the
+    gaps line up exactly.
+    """
     y = get_target(sold)
-    assert (y == sold["FDiscount"]).all()
+    assert y.isna().equals(sold["FDiscount"].isna()), "get_target changed which values are missing"
+    present = sold["FDiscount"].notna()
+    assert (y[present] == sold["FDiscount"][present]).all()
 
 
 def test_baseline_predicts_and_reports_basis(sold):

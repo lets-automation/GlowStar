@@ -34,22 +34,87 @@ from ..validation import metrics as M
 
 log = logging.getLogger(__name__)
 
-# A candidate may be at most this many MAE points worse than the incumbent and
+# A candidate may be at most this many MAE points worse than the INCUMBENT and
 # still be promoted (small wiggle for run-to-run noise). Configurable.
 PROMOTE_TOLERANCE_PTS = 0.25
 
+# ...and at most this many points worse than the BEST model ever recorded.
+#
+# WHY THIS SECOND BOUND EXISTS — a real, observed failure
+# ------------------------------------------------------
+# The incumbent-only rule is a RATCHET. The reference point is replaced by every
+# promotion, so the bar it sets moves with it. A candidate 0.24 worse than the
+# incumbent is promoted, becomes the incumbent, and the next night's bar is 0.24
+# higher again. Nothing bounds the total.
+#
+# This is not hypothetical. Measured on the first three production models:
+#     2.469 -> 2.605 -> 2.815   (+0.346 in two nights)
+# Both promotions were inside tolerance; the gate never objected. Projected
+# forward at the same rate the model reaches MAE ~4.96 in ten nights, with every
+# single log line reading `promoted: True`.
+#
+# So drift is now measured from the BEST MAE ever achieved, not from whatever
+# happened to be live yesterday.
+#
+# WHY A BOUND AND NOT "must beat the best"
+# ----------------------------------------
+# Refusing anything worse than the best-ever would freeze the model the first
+# time the market genuinely gets harder or the test window shifts — and a frozen
+# model that quietly stops tracking reality is a failure this project has already
+# been bitten by (see the feedback note below). Bounding cumulative drift keeps
+# the model tracking day to day while capping how far it can wander.
+MAX_DRIFT_FROM_BEST_PTS = 0.50
+
+# Absolute backstop. Deliberately far above any value this engine has ever
+# produced (it has run between ~2.4 and ~4.0), because its job is to catch a
+# CATASTROPHE — a broken feed, a corrupted target, a bug that makes the model
+# meaningless — not to act as a quality bar. The relative rules above do the
+# quality work. Set too low it would block legitimate models during a genuinely
+# hard market, which is the "gate rejects everything and the retrain silently
+# freezes" failure this project has already been bitten by.
+MAX_ACCEPTABLE_MAE = 8.0
+
 
 def gate_decision(cand_mae: float | None, inc_mae: float | None,
-                  tolerance: float = PROMOTE_TOLERANCE_PTS) -> tuple[bool, str]:
-    """Pure promotion rule (unit-testable): promote unless the candidate is
-    materially worse than the incumbent on the out-of-time test window."""
+                  best_mae: float | None = None,
+                  tolerance: float = PROMOTE_TOLERANCE_PTS,
+                  max_drift: float = MAX_DRIFT_FROM_BEST_PTS,
+                  ceiling: float = MAX_ACCEPTABLE_MAE) -> tuple[bool, str]:
+    """Pure promotion rule (unit-testable). ALL of these must hold:
+
+      1. the candidate is not materially worse than the INCUMBENT (day-to-day), and
+      2. it has not drifted too far from the BEST model ever seen (anti-ratchet), and
+      3. it is under an absolute ceiling (catastrophe backstop).
+
+    `best_mae` is optional so old callers keep working, but the nightly retrain
+    always passes it — without it, rule 2 cannot apply and the ratchet returns.
+    """
     if cand_mae is None:
         return False, "no test window to evaluate — not promoting"
+
+    if cand_mae > ceiling:
+        return False, (f"candidate MAE {cand_mae} exceeds the absolute ceiling "
+                       f"{ceiling} — refusing regardless of the incumbent")
+
     if inc_mae is None:
         return True, "no incumbent — promoting first model"
-    if cand_mae <= inc_mae + tolerance:
-        return True, f"candidate MAE {cand_mae} <= incumbent {inc_mae} + tol {tolerance}"
-    return False, f"candidate MAE {cand_mae} worse than incumbent {inc_mae} + tol {tolerance}"
+
+    if cand_mae > inc_mae + tolerance:
+        return False, (f"candidate MAE {cand_mae} worse than incumbent {inc_mae} "
+                       f"+ tol {tolerance}")
+
+    # Anti-ratchet: measured against the best ever, which never moves upward.
+    if best_mae is not None and cand_mae > best_mae + max_drift:
+        return False, (f"candidate MAE {cand_mae} has drifted more than "
+                       f"{max_drift} from the best ever recorded ({best_mae}) — "
+                       f"not promoting. The model is degrading night over night; "
+                       f"investigate before this is relaxed.")
+
+    reason = f"candidate MAE {cand_mae} <= incumbent {inc_mae} + tol {tolerance}"
+    if best_mae is not None:
+        drift = round(cand_mae - best_mae, 3)
+        reason += f"; drift from best {best_mae} is {drift:+} (cap {max_drift})"
+    return True, reason
 
 
 def serving_config(split_date: str | None = None) -> EngineConfig:
@@ -146,7 +211,13 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
     # 4. Promotion gate vs the incumbent.
     _, incumbent = registry.load_current()
     inc_mae = (incumbent or {}).get("test_mae")
-    promote, reason = gate_decision(metrics["mae"], inc_mae, tolerance)
+    # The best MAE ever recorded — a reference point that cannot drift upward.
+    # Without it the gate is a ratchet; see gate_decision.
+    best = registry.best_mae()
+    promote, reason = gate_decision(metrics["mae"], inc_mae, best, tolerance)
+    if best is not None and metrics["mae"] is not None:
+        log.info("gate: candidate %.3f | incumbent %s | best ever %.3f | drift %+.3f",
+                 metrics["mae"], inc_mae, best, metrics["mae"] - best)
 
     # 5. Save a PRODUCTION engine (trained on ALL sold + feedback); promote if gated.
     prod = PricingEngine(serving_config(split_date)).fit(
