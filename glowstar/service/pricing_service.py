@@ -48,7 +48,13 @@ class StoneIn(BaseModel):
     CPS: str = "NA"
     Fluorescence: str = "Non"
     Lab: str = "GIA"
-    Location: str = "NA"
+    # "IND", not "NA". Location is a CATEGORICAL the model was fitted on, and its
+    # trained vocabulary is {IND, HKG, UAE, Belgium, USA, BKK} — "NA" is NOT in
+    # it. HistGradientBoosting silently ignores an unseen category, so the old
+    # default meant every caller who omitted Location (i.e. the CRM, on every
+    # request) had the feature quietly dropped. No error, no flag.
+    # IND is 64% of training and this is an Indian desk selling from India.
+    Location: str = "IND"
     # Rap is OPTIONAL — we look it up from the licensed sheet when it is absent.
     #
     # It used to be required, which quietly made the caller responsible for the
