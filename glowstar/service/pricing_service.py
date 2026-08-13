@@ -179,7 +179,15 @@ class PricingService:
         suggestion = self.engine.predict(df)[0]
         facts = asdict(suggestion)
         facts["coverage_pct"] = int(self.engine.cfg.coverage * 100)
-        rap_change = self._apply_rap_change(facts, stone)
+        # Pass the RESOLVED Rap, not `stone.Rap`. Rap is optional on StoneIn and
+        # is looked up in `_to_frame`, which builds a row rather than mutating
+        # the stone — so `stone.Rap` stays None on the recommended call pattern
+        # (and FrontOffice never sends it). `_apply_rap_change` multiplied that
+        # None by a float, so the FIRST stone whose Rap cell had moved inside the
+        # adjustment window would have returned a 500. Dormant only because no
+        # ingested sheet is currently inside the window — it would have detonated
+        # on the next sheet the client sends, which we ask for regularly.
+        rap_change = self._apply_rap_change(facts, stone, float(df["Rap"].iloc[0]))
         out = {"suggestion": facts, "market": self._market_context()}
         if rap_change is not None:
             out["rap_change"] = rap_change
@@ -187,7 +195,8 @@ class PricingService:
             out["explanation"] = narrate(facts)
         return out
 
-    def _apply_rap_change(self, facts: dict, stone: StoneIn) -> dict | None:
+    def _apply_rap_change(self, facts: dict, stone: StoneIn,
+                          rap: float) -> dict | None:
         """If the stone's Rap cell recently moved, attach the red-line info and,
         while inside the adjustment window, widen the band and flag it. The
         suggested DISCOUNT is unchanged (it already applies to the current Rap);
@@ -199,7 +208,7 @@ class PricingService:
             w = _RAP_CHANGE_CI_WIDEN_PTS
             facts["ci_discount_low"] = round(facts["ci_discount_low"] - w, 2)
             facts["ci_discount_high"] = round(facts["ci_discount_high"] + w, 2)
-            rap, wt = stone.Rap, stone.Weight
+            wt = stone.Weight
             facts["ci_net_low"] = round(rap * (1 + facts["ci_discount_low"] / 100.0) * wt, 2)
             facts["ci_net_high"] = round(rap * (1 + facts["ci_discount_high"] / 100.0) * wt, 2)
             facts["flags"] = sorted(set(facts.get("flags", []) + ["rap_recently_changed"]))

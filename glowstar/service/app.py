@@ -43,6 +43,38 @@ from .frontoffice import (FrontOfficeStone, FrontOfficeReason,
 
 log = logging.getLogger(__name__)
 
+
+def _grid_age_days() -> int | None:
+    """Days since the newest edit in the point-in-time grid history.
+
+    Reads the file's tail rather than parsing ~100 MB of JSON — health must stay
+    fast enough to be polled. Returns None if there is no history at all.
+    """
+    import datetime as _dt
+    import re as _re
+    from ..config import PATHS
+
+    p = getattr(PATHS, "grid_history", None)
+    if p is None:
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[2] / "data" / "master_grid" / "history.json"
+    if not p.exists():
+        return None
+    newest = ""
+    pat = _re.compile(rb'"(20\d\d-\d\d-\d\d)T')
+    with p.open("rb") as fh:
+        size = p.stat().st_size
+        # The store is keyed by cell, so dates are scattered — scan the last few
+        # MB, which reliably contains recent edits without reading the whole file.
+        fh.seek(max(0, size - (4 << 20)))
+        for m in pat.finditer(fh.read()):
+            d = m.group(1).decode()
+            if d > newest:
+                newest = d
+    if not newest:
+        return None
+    return (_dt.date.today() - _dt.date.fromisoformat(newest)).days
+
 if FastAPI is not None:
 
     class DecisionIn(BaseModel):
@@ -164,6 +196,44 @@ if FastAPI is not None:
         except OSError:
             out["status"] = "degraded"
             out["records_age_hours"] = None
+        # GRID FRESHNESS — the thing CLAUDE.md calls "the whole ballgame", and
+        # the single largest measured driver of pricing error (fresh cell ~2.0
+        # MAE, 30d+ stale ~3.1).
+        #
+        # It was ABSENT from every health surface, and that is precisely how the
+        # nightly jobs stayed dead for fifteen days without anyone noticing:
+        # `records.json` kept refreshing, so this endpoint stayed green while the
+        # grid rotted underneath it. Health that reports the healthy half of a
+        # broken pipeline is worse than no health check at all.
+        try:
+            age_d = _grid_age_days()
+            out["grid_age_days"] = age_d
+            if age_d is None:
+                out["status"] = "degraded"
+                out["warning"] = "no grid history on disk"
+            elif age_d > 3:
+                out["status"] = "degraded"
+                out["warning"] = (f"price grid is {age_d} days stale — the nightly "
+                                  f"job may have stopped")
+        except Exception:
+            out["status"] = "degraded"
+            out["grid_age_days"] = None
+
+        # MODEL AGE. The promotion gate protects against a BAD model; nothing
+        # protected against NO model. A retrain that dies before reaching the
+        # gate leaves the incumbent serving forever and logs nothing loud.
+        try:
+            trained = (out.get("model") or {}).get("trained_at")
+            if trained:
+                days = (_dt.datetime.now() - _dt.datetime.fromisoformat(trained)).days
+                out["model"]["age_days"] = days
+                if days > 2:
+                    out["status"] = "degraded"
+                    out["warning"] = (f"model is {days} days old — the nightly "
+                                      f"retrain has not promoted since then")
+        except Exception:
+            pass
+
         # Surface the store: an API that is "ok" while silently failing to record
         # anything is the failure mode this whole layer exists to prevent.
         try:

@@ -149,7 +149,26 @@ def _assert_gate_scores_what_ships(engine: PricingEngine) -> None:
 
 
 def _evaluate(engine: PricingEngine, test) -> dict:
+    """Score the engine out-of-time, with the grid joined POINT-IN-TIME.
+
+    `predict()` deliberately attaches TODAY's grid when a caller has not supplied
+    one — correct when serving, because the desk really does price from today's
+    grid. It is wrong for a backtest: it shows a June sale the August grid, so
+    the gate scored a feature distribution the model was never trained on
+    (training joins per-row `OrderDate`). `predict()` documents that a
+    backtesting caller must attach point-in-time beforehand — and this function,
+    the one the promotion gate uses, did not.
+
+    Measured on one model/test set: today's-grid 2.648 MAE vs point-in-time
+    2.390. Every promote/reject decision so far was made on the wrong number.
+    It happened to be pessimistic, but that direction was luck, not design —
+    it is CLAUDE.md Trap 5 again: evaluate the pipeline that SHIPS.
+    """
     _assert_gate_scores_what_ships(engine)
+    if getattr(engine, "grid_history", None) is not None \
+            and "grid_discount" not in test.columns:
+        from ..market.grid_history import attach_grid
+        test = attach_grid(test, engine.grid_history)   # asof=None => per-row OrderDate
     sugg = engine.predict(test)
     pred = np.array([s.suggested_discount for s in sugg])
     lo = np.array([s.ci_discount_low for s in sugg])

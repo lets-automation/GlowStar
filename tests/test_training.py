@@ -151,3 +151,57 @@ def test_best_mae_ignores_corrupt_cards(tmp_path, monkeypatch):
     (tmp_path / "v2").mkdir(); (tmp_path / "v2" / "metrics.json").write_text('{"test_mae": 2.1}')
     (tmp_path / "v3").mkdir(); (tmp_path / "v3" / "metrics.json").write_text('not json at all')
     assert registry.best_mae() == 2.1
+
+
+def test_gate_evaluates_with_point_in_time_grid():
+    """The gate must not show a June sale the August grid.
+
+    `predict()` attaches TODAY's grid when the caller supplies none — right for
+    serving, wrong for a backtest. `_evaluate` (the gate's own scorer) did not
+    attach point-in-time first, so it scored a feature distribution the model was
+    never trained on: 2.659 MAE vs 2.408 honest, +0.251 off the truth, on every
+    promote/reject decision made so far. CLAUDE.md Trap 5, fourth head.
+
+    Behavioural, not a source grep: an earlier version of this test asserted on
+    the text of the function and tripped over a comment. Assert what the code
+    DOES — that the grid is joined with no fixed `asof`, i.e. per-row OrderDate.
+    """
+    from glowstar.training import retrain as R
+    from glowstar.training.retrain import serving_config
+
+    seen = {}
+
+    def _spy(df, history, asof=None):
+        seen["asof"] = asof
+        seen["n"] = len(df)
+        out = df.copy()
+        out["grid_discount"] = float("nan")
+        out["grid_age_days"] = float("nan")
+        return out
+
+    class _Eng:
+        cfg = serving_config("2026-06-01")
+        grid_history = object()          # non-None so the join is attempted
+        def predict(self, df, as_of=None):
+            return []
+
+    test = pd.DataFrame({
+        "FDiscount": [-50.0, -45.0],
+        "OrderDate_dt": pd.to_datetime(["2026-06-05", "2026-07-20"]),
+    })
+
+    import glowstar.market.grid_history as GH
+    orig = GH.attach_grid
+    GH.attach_grid = _spy
+    try:
+        try:
+            R._evaluate(_Eng(), test)
+        except Exception:
+            pass                          # metrics on an empty prediction may fail
+    finally:
+        GH.attach_grid = orig
+
+    assert "asof" in seen, "_evaluate did not join the grid at all"
+    assert seen["asof"] is None, (
+        f"_evaluate pinned the grid to {seen['asof']!r}; it must pass no asof so "
+        "each row sees the grid as it was on ITS OWN OrderDate")

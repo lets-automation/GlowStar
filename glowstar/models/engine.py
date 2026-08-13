@@ -723,6 +723,21 @@ class PricingEngine:
             flags.append("fancy_color")
         if self._shape_counts.get(row["Shape_full"], 0) < self.cfg.min_segment_samples:
             flags.append("rare_shape")
+        # NO GRID CELL. Measured on production: these are ~3.5% of volume, carry
+        # ~4x the error of a fresh-cell stone (7.10 MAE vs 1.71), are wrong by
+        # >=5 points four times in ten — and the published 80% band holds only
+        # 54.5% of the time for them, because the conformal quantiles are global.
+        #
+        # Two-thirds of them previously raised NO flag at all, so the desk saw a
+        # confident price with a normal-looking range and nothing telling them to
+        # look. A confidence interval is a promise; this one was true on average
+        # and false exactly where the desk needed it.
+        #
+        # The flag does not fix the band — per-bucket conformal is the real fix
+        # and needs measuring — but it stops the silence, which is the part that
+        # costs credibility.
+        if "grid_discount" in row.index and pd.isna(row.get("grid_discount")):
+            flags.append("no_grid_cell")
         return flags
 
     # --- prediction (batch) ---

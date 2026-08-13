@@ -113,8 +113,10 @@ def grid_for_shape(shape_code: str | None, shape_full: str | None) -> RapGrid:
 _SHAPE_FULL: dict[str, str] = {
     "ROUND": "Round", "RBC": "Round", "RB": "Round", "BR": "Round", "RD": "Round",
     "BRILLIANT": "Round", "ROUND BRILLIANT": "Round",
-    "OVAL": "Oval", "OB": "Oval", "OV": "Oval", "S.OV": "Oval", "SOV": "Oval",
-    "F.OVAL": "Oval",
+    # NOTE: `S.OV` is deliberately NOT mapped here. It is a DISTINCT trained
+    # level (24 stones) meaning a stepped oval, not a synonym for Oval (3,654).
+    # Mapping it collapsed a real category the model prices separately.
+    "OVAL": "Oval", "OB": "Oval", "OV": "Oval", "F.OVAL": "Oval",
     "PEAR": "Pear", "PB": "Pear", "PS": "Pear", "PMB": "Pear",
     "MARQUISE": "Marquise", "MB": "Marquise", "MQ": "Marquise",
     "HEART": "Heart", "HB": "Heart", "HS": "Heart",
@@ -153,6 +155,21 @@ _CPS_GRADE: dict[str, str] = {
 # Whole-string spellings of triple-excellent that carry no separators to split on.
 _TRIPLE_EX = {"3EX", "3X", "XXX", "EXEXEX", "TRIPLEEX", "TRIPLEEXCELLENT", "3EXCELLENT"}
 
+# The COMPLETE vocabulary the model is trained on, read from the client's own
+# realized sales: {'3EX', 'EX', 'FR', 'GD', 'VG', 'VG-GD'}.
+#
+# `VG-GD` is a REAL level with 405 stones (1.5% of training data), not a
+# malformed value. The first version of this normaliser collapsed it to `VG`
+# because it split on the separator and returned the cut grade — which meant a
+# stone entering through the API priced 1.77 pts differently from the same stone
+# entering through the Excel path. That is Trap 9 all over again, introduced by
+# the very fix written to prevent it.
+#
+# So: combinations that the model has actually SEEN are preserved; combinations
+# it has never seen still collapse to the cut grade, because an unseen category
+# is what caused the original bug.
+_CPS_TRAINED = {"3EX", "EX", "VG", "GD", "FR", "PR", "VG-GD"}
+
 
 def normalize_cps(raw: str | None) -> str:
     """Canonicalise a cut/polish/symmetry code to the trained vocabulary.
@@ -184,6 +201,13 @@ def normalize_cps(raw: str | None) -> str:
     if grades and all(g is not None for g in grades):
         if len(grades) >= 3 and all(g == "EX" for g in grades[:3]):
             return "3EX"
+        # Keep a two-grade combination if the model was actually trained on it
+        # (e.g. VG-GD, 405 stones). Collapsing a level the model knows throws
+        # away real signal and makes the API disagree with the Excel path.
+        if len(grades) == 2:
+            combined = f"{grades[0]}-{grades[1]}"
+            if combined in _CPS_TRAINED:
+                return combined
         return grades[0]        # the cut grade — what the model knows
     return "NA"
 
@@ -191,17 +215,27 @@ def normalize_cps(raw: str | None) -> str:
 def normalize_shape(raw: str | None) -> str | None:
     """Canonicalise a shape code or spelling to the engine's `Shape_full`.
 
-    Unknown shapes are passed through TITLE-CASED rather than forced to a
-    default: the client genuinely trades shapes outside this table, and silently
-    relabelling one as Round would be far worse than routing it as rare — which
-    is the honest answer for a shape we have no history on.
+    ONLY known synonyms are converted. Anything else is returned EXACTLY as it
+    arrived (stripped), never reshaped.
+
+    It used to fall through to `s.title()`, which was wrong in the same way the
+    CPS collapse was wrong: the client trades small-volume shapes whose trained
+    names are not title-case — `S.MQ`, `DECA BRI`, `OLD MINE CL`,
+    `FLAME STEP CUT`. Title-casing them produced `S.Mq`, `Deca Bri`, ... none of
+    which match the training vocabulary, so every one of those stones scored
+    zero history, was flagged `rare_shape` and dropped to the sparse fallback.
+
+    The client's systems send the same strings the model trained on, so passing
+    an unrecognised value through untouched is what keeps the two in agreement.
+    A genuinely unknown shape still routes as rare, which is the honest answer
+    for something we have no history on.
     """
     if raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-    return _SHAPE_FULL.get(s.upper(), s.title())
+    return _SHAPE_FULL.get(s.upper(), s)
 
 
 # --- Fluorescence ----------------------------------------------------------

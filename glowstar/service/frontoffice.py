@@ -218,7 +218,7 @@ def _confidence_score(facts: dict) -> int:
     elif comps < 25:
         score -= 10
     flags = set(facts.get("flags") or [])
-    if flags & {"fluor_review", "bgm_review", "rare_shape", "fancy_color"}:
+    if flags & {"fluor_review", "bgm_review", "rare_shape", "fancy_color", "no_grid_cell"}:
         score -= 20                     # we have told the desk we price these badly
     if facts.get("method") == "fallback":
         score -= 20

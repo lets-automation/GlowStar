@@ -434,10 +434,18 @@ def test_normalize_shape_is_idempotent():
         assert normalize_shape(canonical) == canonical, canonical
 
 
-def test_unknown_shape_is_not_silently_relabelled():
-    """A shape we have no history on must stay itself, not become a Round."""
+def test_unknown_shape_is_passed_through_untouched():
+    """A shape we have no synonym for must be returned EXACTLY as sent.
+
+    It used to be title-cased, which mutated real trained levels (`S.MQ` ->
+    `S.Mq`, `DECA BRI` -> `Deca Bri`) so they no longer matched training and
+    dropped to the sparse fallback.
+    """
     from glowstar.reference.normalize import normalize_shape
-    assert normalize_shape("TRILLIANT") == "Trilliant"
+    assert normalize_shape("TRILLIANT") == "TRILLIANT"
+    assert normalize_shape("S.MQ") == "S.MQ"
+    assert normalize_shape("DECA BRI") == "DECA BRI"
+    assert normalize_shape("  Round  ") == "Round"
     assert normalize_shape("") is None and normalize_shape(None) is None
 
 
@@ -580,3 +588,58 @@ def test_engine_fit_survives_a_missing_target_end_to_end():
     # And it must actually price afterwards, not merely survive fitting.
     s = eng.predict(test.head(5))
     assert len(s) == 5 and all(x.suggested_ppc > 0 for x in s)
+
+
+# --- entry-point parity over the FULL trained vocabulary --------------------
+# CLAUDE.md's rule after Trap 9: "price the SAME stone through the old and the
+# new path and assert they agree." That was only ever tested with one example
+# per known bug, so `VG-GD` — a real level with 405 training stones — slipped
+# through: normalize_cps collapsed it to VG and the API priced it 1.77pts away
+# from the Excel path. This asserts over EVERY value the model was trained on.
+
+def test_every_trained_cps_value_survives_normalisation():
+    from glowstar.data.loaders import load_records, sold_stones
+    from glowstar.reference.normalize import normalize_cps
+    sold = sold_stones(load_records()[0], drop_outliers=True)
+    trained = {str(v) for v in sold["CPS"].dropna().unique()}
+    assert trained, "no CPS vocabulary found — the check would be vacuous"
+    lost = {v: normalize_cps(v) for v in trained if normalize_cps(v) != v}
+    assert not lost, f"normalisation destroys trained CPS levels: {lost}"
+
+
+def test_every_trained_shape_value_survives_normalisation():
+    from glowstar.data.loaders import load_records, sold_stones
+    from glowstar.reference.normalize import normalize_shape
+    sold = sold_stones(load_records()[0], drop_outliers=True)
+    trained = {str(v) for v in sold["Shape_full"].dropna().unique()}
+    assert trained
+    lost = {v: normalize_shape(v) for v in trained if normalize_shape(v) != v}
+    assert not lost, f"normalisation destroys trained shapes: {lost}"
+
+
+# --- Rap omitted + Rap cell recently moved = 500 ---------------------------
+# Rap is OPTIONAL on StoneIn and resolved server-side, which is the documented
+# call pattern and the only one FrontOffice uses. `_apply_rap_change` read
+# `stone.Rap` (still None) and multiplied it by a float. Dormant only because no
+# ingested sheet sits inside the 5-day window — it detonates on the next sheet
+# the client sends.
+
+def test_price_without_rap_survives_a_recently_changed_rap_cell():
+    from unittest.mock import patch
+    from glowstar.service.pricing_service import PricingService, StoneIn
+
+    class _Info:
+        changed, in_window = True, True
+        def as_dict(self): return {"changed": True, "in_window": True}
+
+    svc = PricingService()
+    stone = StoneIn(Shape_full="ROUND", Weight=1.01, Color="G", Clarity="VS1")
+    assert stone.Rap is None, "the caller deliberately omits Rap"
+
+    with patch.object(svc._rap_monitor, "check", return_value=_Info()):
+        out = svc.price(stone)          # used to raise TypeError: NoneType * float
+
+    f = out["suggestion"]
+    assert "rap_recently_changed" in f["flags"]
+    # The widened band must be real money, not None or nonsense.
+    assert f["ci_net_low"] > 0 and f["ci_net_high"] > f["ci_net_low"]
