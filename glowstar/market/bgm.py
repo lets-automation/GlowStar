@@ -80,7 +80,23 @@ def assess(stone: dict, tables) -> BgmAssessment:
     # (that would double-count what the model already prices).
     milky_o, brown_o = _ord(stone.get("milky_ord")), _ord(stone.get("brown_ord"))
     if milky_o is not None or brown_o is not None:
+        # `or 0` turned an UNASSESSED None into 0.0 — the value that means
+        # "assessed and clean". A stone with brown graded and milky missing came
+        # back state="clean", assumes_no_bgm=False, and told the desk
+        # "Assessed No-BGM from your inventory" about a field nobody had looked
+        # at. No price moved (the deduction is 0.0 either way), but it is the
+        # exact 0.0-vs-unassessed conflation Trap 4 exists to prevent, and it
+        # states something untrue to the person deciding.
+        partial = milky_o is None or brown_o is None
         m, b = milky_o or 0, brown_o or 0
+        if m == 0 and b == 0 and partial:
+            return BgmAssessment(
+                state="partial", milky_severity="none", shade_class="none",
+                deduction_pts=0.0, assumes_no_bgm=True,
+                note="Partially assessed: "
+                     + ("milky" if milky_o is None else "brown")
+                     + " was not graded in your inventory. Priced at the clean "
+                       "base, but this is NOT a confirmed No-BGM stone.")
         if m == 0 and b == 0:
             return BgmAssessment(
                 state="clean", milky_severity="none", shade_class="none",

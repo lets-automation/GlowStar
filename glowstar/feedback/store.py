@@ -123,6 +123,34 @@ class FeedbackRecord:
                 "required so the model learns WHY, not just that it was wrong.")
 
 
+# The single definition of "can this correction teach the model anything?".
+#
+# It lives here, once, and is PERSISTED AS A BOOLEAN so that nothing downstream
+# has to re-derive it by string-matching "NA". Two separate bugs came from not
+# having this:
+#   * the API reported trainable=true whenever a desk price was present, even
+#     with no stone attached;
+#   * the database column did the same, so 14 real desk corrections are stored
+#     marked trainable when not one of them can be attached to a price cell.
+# Corrections are learned PER PRICE CELL, so a desk price without shape /
+# weight / colour / clarity is an opinion with nowhere to put it.
+UNKNOWN_ATTR = "NA"
+
+
+def is_trainable(fb: "FeedbackRecord") -> bool:
+    """True only when the record carries BOTH a desk price and a real stone."""
+    if fb.human_discount is None:
+        return False
+    try:
+        weight_ok = float(fb.weight or 0) > 0
+    except (TypeError, ValueError):
+        weight_ok = False
+    return (weight_ok
+            and str(fb.shape_full or UNKNOWN_ATTR) != UNKNOWN_ATTR
+            and str(fb.color or UNKNOWN_ATTR) != UNKNOWN_ATTR
+            and str(fb.clarity or UNKNOWN_ATTR) != UNKNOWN_ATTR)
+
+
 def record(fb: FeedbackRecord, path: Path | None = None) -> Path:
     """Append one decision to the immutable JSONL log."""
     fb.validate()
@@ -138,7 +166,7 @@ def record(fb: FeedbackRecord, path: Path | None = None) -> Path:
         from ..store import db
         db.record_decision(rec=asdict(fb), variance=fb.variance,
                            needs_attention=fb.needs_attention,
-                           trainable=fb.human_discount is not None)
+                           trainable=is_trainable(fb))
     except Exception:
         log.exception("decision written to JSONL but NOT to the store")
     log.info("Recorded %s for stone %s (reason=%s)", fb.decision, fb.stone_id, fb.reason_code)

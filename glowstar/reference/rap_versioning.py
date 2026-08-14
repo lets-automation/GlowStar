@@ -247,10 +247,24 @@ class RapChangeMonitor:
         if ch is None or not self.new_version:
             return _NO_CHANGE
         pricing_date = pricing_date or date.today()
+        # Measure the window from when we could FIRST HAVE KNOWN, not from the
+        # sheet's printed date. Sheets arrive by email and are ingested late —
+        # the 2026-06-26 list was ingested on 2026-07-28, 32 days after its list
+        # date. Measured from the list date the 5-day adjustment window had
+        # closed before the data existed, so band-widening for a re-based cell
+        # has never once fired, and never would have.
         try:
-            days = (pricing_date - date.fromisoformat(self.new_version)).days
+            listed = date.fromisoformat(self.new_version)
         except ValueError:
-            days = None
+            listed = None
+        known_from = listed
+        ingested = getattr(self, "ingested_at", None)
+        if listed is not None and ingested:
+            try:
+                known_from = max(listed, date.fromisoformat(str(ingested)[:10]))
+            except ValueError:
+                pass
+        days = (pricing_date - known_from).days if known_from is not None else None
         in_window = days is not None and 0 <= days <= self.window_days
         direction = "up" if ch.delta_pct > 0 else "down"
         msg = (f"Rapaport list for this segment moved {ch.delta_pct:+.1f}% on "

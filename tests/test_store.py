@@ -195,3 +195,50 @@ def test_audit_failure_never_costs_the_price(monkeypatch):
     # record_quote swallows everything internally; it must not raise.
     db.record_quote(facts={"suggested_discount": -50.0}, stone={"StoneId": "X"},
                     model_version="v1", source="api")
+
+
+# --- one definition of "trainable", persisted as a boolean ------------------
+# Two copies of this rule drifted apart in production: the API reported
+# trainable=true whenever a desk price was present, and the DB column did the
+# same — so 14 real desk corrections are stored marked trainable when not one of
+# them carries a stone and none can ever train a price cell.
+
+def _fb(**kw):
+    from glowstar.feedback.store import FeedbackRecord
+    base = dict(stone_id="S1", decision="override", suggested_discount=-50.0,
+                suggested_net=0.0, shape_full="Round", weight=1.01,
+                color="G", clarity="VS1", human_discount=-55.0)
+    base.update(kw)
+    return FeedbackRecord(**base)
+
+
+def test_trainable_needs_a_desk_price():
+    from glowstar.feedback.store import is_trainable
+    assert is_trainable(_fb()) is True
+    assert is_trainable(_fb(human_discount=None)) is False
+
+
+def test_trainable_needs_a_real_stone():
+    """The production bug: desk price present, stone hardcoded to NA/0."""
+    from glowstar.feedback.store import is_trainable
+    assert is_trainable(_fb(shape_full="NA", weight=0.0,
+                            color="NA", clarity="NA")) is False
+    assert is_trainable(_fb(weight=0.0)) is False
+    assert is_trainable(_fb(shape_full="NA")) is False
+    assert is_trainable(_fb(color="NA")) is False
+    assert is_trainable(_fb(clarity="NA")) is False
+
+
+def test_trainable_survives_junk_weight():
+    from glowstar.feedback.store import is_trainable
+    assert is_trainable(_fb(weight=None)) is False
+    assert is_trainable(_fb(weight="abc")) is False
+
+
+def test_api_and_store_share_one_definition():
+    """Two copies of the rule is exactly how they drifted apart."""
+    import inspect
+    from glowstar.service import app as A
+    src = inspect.getsource(A)
+    assert "is_trainable(rec)" in src, "API must use the shared definition"
+    assert '"trainable": desk is not None' not in src, "the old duplicate rule is back"

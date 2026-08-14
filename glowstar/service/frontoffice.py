@@ -138,6 +138,42 @@ class FrontOfficeReason(BaseModel):
     deskPpc: float | None = None
     stoneId: str | None = None
     user: str | None = ""
+    # THE STONE ITSELF. Optional so the CRM's existing calls keep working, but
+    # without these (or a certificate we can resolve) the record is UNTRAINABLE:
+    # corrections are learned per PRICE CELL, and a cell needs shape/weight/
+    # colour/clarity. The first version hardcoded "NA"/0.0 here, so 14 real desk
+    # corrections — each one carrying the desk's own price, exactly what we had
+    # asked them for — were stored with no stone attached and could never teach
+    # anything. Supplied values win; otherwise we look the stone up.
+    shape: str | None = None
+    weight: float | None = None
+    color: str | None = None
+    clarity: str | None = None
+
+
+def resolve_stone(certificate_no: str | None, stone_id: str | None) -> dict | None:
+    """Find a stone's attributes from the inventory by certificate or id.
+
+    Returns None when the stone is not ours — an external stone is a legitimate
+    case, and the caller must then record the record as unattributable rather
+    than invent values for it.
+    """
+    try:
+        from ..data.loaders import load_records
+        df, _ = load_records()
+        for col, val in (("CertificateNo", certificate_no), ("StoneId", stone_id)):
+            if not val or col not in df.columns:
+                continue
+            hit = df[df[col].astype(str) == str(val)]
+            if len(hit):
+                r = hit.iloc[-1]
+                return {"shape_full": str(r.get("Shape_full") or "NA"),
+                        "weight": float(r.get("Weight") or 0.0),
+                        "color": str(r.get("Color") or "NA"),
+                        "clarity": str(r.get("Clarity") or "NA")}
+    except Exception:
+        log.exception("could not resolve stone %s / %s", certificate_no, stone_id)
+    return None
 
 
 class MasterDiscountRequest(BaseModel):

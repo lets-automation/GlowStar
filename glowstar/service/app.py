@@ -304,7 +304,7 @@ if FastAPI is not None:
         """
         from ..feedback.store import (Decision, FeedbackRecord, record,
                                       VARIANCE_REASON_THRESHOLD_PTS,
-                                      needs_attention, variance_pts)
+                                      is_trainable, needs_attention, variance_pts)
 
         if d.decision not in {x.value for x in Decision}:
             raise HTTPException(status_code=422,
@@ -387,19 +387,43 @@ if FastAPI is not None:
         """
         from ..feedback.store import (Decision, FeedbackRecord, record,
                                       VARIANCE_REASON_THRESHOLD_PTS,
-                                      needs_attention, variance_pts)
+                                      is_trainable, needs_attention, variance_pts)
         desk = fr.deskDiscount
         if desk is None and fr.deskPpc is not None:
             raise HTTPException(
                 status_code=422,
                 detail="deskPpc needs the stone's Rap to convert; send deskDiscount "
                        "or include rap")
+        # THE STONE MUST BE ATTACHED, or the record teaches nothing. Corrections
+        # are learned per price cell, and a cell is shape/weight/colour/clarity.
+        # This used to hardcode "NA"/0.0, which silently made every desk
+        # correction untrainable — 14 of them, each carrying the desk's own
+        # price, the hardest feedback in the world to obtain.
+        # Order: what the caller sent, else look the stone up, else record it
+        # honestly as unattributable.
+        from .frontoffice import resolve_stone
+        found = resolve_stone(fr.certificateNo, fr.stoneId) or {}
+        shape = fr.shape or found.get("shape_full") or "NA"
+        weight = fr.weight if fr.weight is not None else found.get("weight", 0.0)
+        color = fr.color or found.get("color") or "NA"
+        clarity = fr.clarity or found.get("clarity") or "NA"
+        attributable = shape != "NA" and float(weight or 0) > 0
+
+        note = f"certificateNo={fr.certificateNo}"
+        if not attributable:
+            note += " | UNATTRIBUTABLE: no stone attributes supplied and the " \
+                    "certificate did not match inventory — stored for analytics " \
+                    "only, cannot train a price cell"
+            log.warning("feedback for %s has no resolvable stone — untrainable",
+                        fr.certificateNo)
+
         rec = FeedbackRecord(
             stone_id=fr.stoneId or fr.certificateNo,
             decision=(Decision.OVERRIDE.value if desk is not None else Decision.REJECT.value),
             suggested_discount=fr.aiDiscount, suggested_net=0.0,
-            shape_full="NA", weight=0.0, color="NA", clarity="NA",
-            reason_code=fr.reason, note=f"certificateNo={fr.certificateNo}",
+            shape_full=shape, weight=float(weight or 0.0),
+            color=color, clarity=clarity,
+            reason_code=fr.reason, note=note,
             human_discount=desk, user=fr.user or "",
         )
         try:
@@ -411,10 +435,19 @@ if FastAPI is not None:
         return {
             "recorded": True,
             "certificateNo": fr.certificateNo,
-            "trainable": desk is not None,
-            "note": ("stored as a training label" if desk is not None else
-                     "stored for ANALYTICS ONLY — send deskDiscount (the desk's own "
-                     "price) to make this a training label"),
+            # ONE definition of trainable, in feedback/store.py, shared with the
+            # database column. Two copies of this rule is how they drifted apart
+            # in the first place: the API said trainable=true while the stored
+            # record could never train anything.
+            "trainable": is_trainable(rec),
+            "stone_resolved": attributable,
+            "note": ("stored as a training label" if (desk is not None and attributable)
+                     else ("stored for ANALYTICS ONLY — send deskDiscount (the desk's "
+                           "own price) to make this a training label"
+                           if desk is None else
+                           "stored for ANALYTICS ONLY — the stone could not be "
+                           "identified; send shape/weight/color/clarity, or a "
+                           "certificateNo that matches your inventory")),
             "variance_pts": None if v is None else round(v, 2),
             "threshold_pts": VARIANCE_REASON_THRESHOLD_PTS,
             "needs_attention": needs_attention(fr.aiDiscount, desk),

@@ -178,14 +178,31 @@ def test_reason_without_the_desks_price_is_stored_but_NOT_trainable(client):
     assert "deskDiscount" in b["note"]
 
 
-def test_reason_with_the_desks_price_IS_trainable(client):
+def test_reason_with_the_desks_price_AND_the_stone_IS_trainable(client):
+    """Both are required. `12345` is not a real certificate, so the stone must
+    be supplied — otherwise the correction cannot be attached to a price cell."""
     r = client.post("/frontoffice/reason", json={
         "certificateNo": "12345", "reason": "market_moved",
-        "aiDiscount": -43.78, "deskDiscount": -48.0})
+        "aiDiscount": -43.78, "deskDiscount": -48.0,
+        "shape": "Round", "weight": 1.01, "color": "G", "clarity": "VS1"})
     b = r.json()
     assert b["trainable"] is True
+    assert b["stone_resolved"] is True
     assert b["variance_pts"] == pytest.approx(4.22, abs=0.01)
     assert b["needs_attention"] is True          # 4.2 pts > the 2-pt threshold
+
+
+def test_reason_without_the_stone_is_NOT_reported_as_trainable(client):
+    """This is the production bug: a desk price with no stone was reported
+    trainable and stored with shape='NA', so it could never train anything."""
+    r = client.post("/frontoffice/reason", json={
+        "certificateNo": "not-a-real-cert-xyz", "reason": "market_moved",
+        "aiDiscount": -43.78, "deskDiscount": -48.0})
+    b = r.json()
+    assert b["recorded"] is True                 # still stored for analytics
+    assert b["stone_resolved"] is False
+    assert b["trainable"] is False
+    assert "could not be identified" in b["note"]
 
 
 # --------------------------------------------------------------------------
@@ -259,3 +276,55 @@ def test_confidence_score_reflects_real_reliability():
             "comparable_count": 3, "flags": ["rare_shape"], "method": "fallback"}
     hi, lo = fo._confidence_score(tight), fo._confidence_score(wide)
     assert hi > 70 and lo < 30 and 0 <= lo <= 100 and 0 <= hi <= 100
+
+
+# --- desk corrections must carry the STONE, or they teach nothing -----------
+# PRODUCTION, 2026-08-14: 14 real desk overrides arrived, every one carrying the
+# desk's own price — exactly what we had asked the client for — and every one was
+# stored with shape="NA", weight=0.0 because the endpoint hardcoded them.
+# Corrections train per PRICE CELL, so all 14 were untrainable. The client was
+# doing their part; we were destroying it on arrival.
+
+def test_reason_uses_supplied_stone_attributes():
+    from glowstar.service.frontoffice import FrontOfficeReason
+    fr = FrontOfficeReason(certificateNo="123", reason="market moved",
+                           aiDiscount=-50.0, deskDiscount=-55.0,
+                           shape="Round", weight=1.01, color="G", clarity="VS1")
+    assert fr.shape == "Round" and fr.weight == 1.01
+
+
+def test_reason_stone_fields_are_optional_for_backwards_compat():
+    """The CRM is live; existing calls must not start failing."""
+    from glowstar.service.frontoffice import FrontOfficeReason
+    fr = FrontOfficeReason(certificateNo="123", reason="x", aiDiscount=-50.0)
+    assert fr.shape is None and fr.weight is None
+
+
+def test_resolve_stone_returns_none_for_an_unknown_certificate():
+    """An external stone is legitimate — we must not invent attributes for it."""
+    from glowstar.service.frontoffice import resolve_stone
+    assert resolve_stone("definitely-not-a-real-certificate-999", None) is None
+
+
+def test_the_stone_is_never_hardcoded_away(client):
+    """BEHAVIOURAL, not a source grep — an earlier version of this test asserted
+    on the exact expression and broke the moment the rule was refactored into a
+    shared helper, while the behaviour was correct throughout.
+
+    What must hold: a correction that names its stone is stored WITH that stone,
+    not overwritten with NA/0 the way production did to 14 real desk overrides.
+    """
+    from glowstar.feedback import store as fbstore
+    r = client.post("/frontoffice/reason", json={
+        "certificateNo": "cert-behavioural-1", "reason": "market_moved",
+        "aiDiscount": -43.0, "deskDiscount": -48.0,
+        "shape": "Round", "weight": 1.01, "color": "G", "clarity": "VS1"})
+    assert r.json()["trainable"] is True
+
+    rec = [x for x in fbstore.load_all()
+           if "cert-behavioural-1" in str(x.get("note", ""))]
+    assert rec, "the correction was not persisted at all"
+    last = rec[-1]
+    assert last["shape_full"] == "Round", "the stone was overwritten"
+    assert float(last["weight"]) == 1.01
+    assert last["color"] == "G" and last["clarity"] == "VS1"

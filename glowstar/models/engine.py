@@ -274,6 +274,21 @@ class PricingEngine:
         # (which over-penalises Strong/Very-Strong fluoro on colourless goods)
         # never discounts fluorescence deeper than the client historically does.
         self._fluor_caps = self._compute_fluor_caps(full)
+        # THE CAPS ARE INERT UNDER THE SHIPPED CONFIG, and that must be loud.
+        # They feed `_model_fluor_penalty` -> `market_extra` -> anchor_predictions
+        # as `lam * (mkt + off + extra)`. Serving runs anchor_lambda = 0.0, so the
+        # penalty is computed and multiplied by zero. Fluorescence is STILL
+        # priced — it is a categorical feature in the GBM — so this is not an
+        # accuracy bug; what is dead is the CAP. Trap 1 is the most carefully
+        # documented trap in CLAUDE.md and `status` prints these values, so the
+        # next person to tune them in response to a fluoro complaint would
+        # measure exactly zero change and lose a day working out why.
+        if self._fluor_caps and self.cfg.anchor_lambda == 0.0:
+            log.warning(
+                "fluoro caps computed (%d segments) but anchor_lambda=0.0, so they "
+                "affect NO shipped price. Fluorescence is priced by the GBM feature; "
+                "tuning _compute_fluor_caps will change nothing until the anchor is on.",
+                len(self._fluor_caps))
 
         # Confidence bands via rolling-origin (forward) conformal calibration:
         # pooled residuals of the SHIPPED pipeline predicting unseen future months.
