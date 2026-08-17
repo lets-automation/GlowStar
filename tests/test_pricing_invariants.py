@@ -643,3 +643,55 @@ def test_price_without_rap_survives_a_recently_changed_rap_cell():
     assert "rap_recently_changed" in f["flags"]
     # The widened band must be real money, not None or nonsense.
     assert f["ci_net_low"] > 0 and f["ci_net_high"] > f["ci_net_low"]
+
+
+# --- fluorescence must reach the model, on EVERY entry point ----------------
+# THE CLIENT FOUND THIS, 2026-08-17: "flo is diff still ai price is same for
+# all." Their CRM sends NON/FNT/MED/STG; the model is trained on Non/Fnt/Med/Stg.
+# Case differed, so the category was unseen and HistGradientBoosting ignored
+# fluorescence ENTIRELY — every level priced identically at -51.22 on a 0.33 F
+# VVS1 when the true spread is -44.25 to -60.12. Trap 9, third time on this
+# boundary, and the most expensive: NON stones were 7 pts too deep, which also
+# explains the desk's "high demand and marketable" overrides at -7.88.
+
+def test_every_trained_fluorescence_value_survives_the_api_boundary():
+    from glowstar.data.loaders import load_records, sold_stones
+    from glowstar.service.pricing_service import StoneIn
+    sold = sold_stones(load_records()[0], drop_outliers=True)
+    trained = {str(v) for v in sold["Fluorescence"].dropna().unique()}
+    assert trained
+    lost = {}
+    for v in trained:
+        got = StoneIn(Shape_full="RBC", Weight=1.0, Color="G",
+                      Clarity="VS1", Fluorescence=v).Fluorescence
+        if got != v:
+            lost[v] = got
+    assert not lost, f"the API boundary mangles trained fluorescence values: {lost}"
+
+
+def test_client_fluorescence_codes_map_to_trained_values():
+    """The exact codes the CRM sends must land on categories the model knows."""
+    from glowstar.data.loaders import load_records, sold_stones
+    from glowstar.service.pricing_service import StoneIn
+    trained = {str(v) for v in
+               sold_stones(load_records()[0], drop_outliers=True)["Fluorescence"].dropna()}
+    for code in ("NON", "FNT", "MED", "STG", "VSTG", "SLT", "VSL"):
+        got = StoneIn(Shape_full="RBC", Weight=1.0, Color="G",
+                      Clarity="VS1", Fluorescence=code).Fluorescence
+        assert got in trained, f"{code!r} -> {got!r}, which the model has never seen"
+
+
+def test_fluorescence_actually_changes_the_price():
+    """The symptom the client reported: different flo, identical price."""
+    from glowstar.service.pricing_service import PricingService, StoneIn
+    svc = PricingService()
+
+    def price(f):
+        return svc.price(StoneIn(Shape_full="RBC", Weight=0.33, Color="F",
+                                 Clarity="VVS1", CPS="3EX",
+                                 Fluorescence=f))["suggestion"]["suggested_discount"]
+
+    non, med, stg = price("NON"), price("MED"), price("STG")
+    assert len({non, med, stg}) == 3, (
+        f"fluorescence is being ignored again: NON={non} MED={med} STG={stg}")
+    assert non > med > stg, "stronger fluorescence must price deeper"

@@ -108,6 +108,35 @@ class StoneIn(BaseModel):
         from ..reference.normalize import normalize_cps
         return normalize_cps(v)
 
+    @field_validator("Fluorescence")
+    @classmethod
+    def _canon_fluor(cls, v: str) -> str:
+        """The same defect as Shape and CPS, and the most expensive of the three.
+
+        The client's CRM sends the feed's own codes — `NON`, `FNT`, `MED`, `STG`.
+        The model is trained on `Non`, `Fnt`, `Med`, `Stg`. Case differs, so
+        HistGradientBoosting saw an unseen category and IGNORED FLUORESCENCE
+        ENTIRELY: every level priced identically at -51.22 on a 0.33 F VVS1,
+        when the true spread is -44.25 (Non) to -60.12 (Stg) — 15.9 points
+        flattened to nothing.
+
+        The client spotted this themselves: "flo is diff still ai price is same
+        for all." It also explains the desk's own feedback — they recorded us
+        7.88 pts too deep on "high demand and marketable" stones, and NON
+        fluorescence commercial goods were exactly 7.0 pts too deep.
+
+        `_FLUOR_MAP` (reporting/price_file.py) is the map the EXCEL path has
+        always used correctly. Trap 9 for the third time on this boundary:
+        normalize_fluorescence() returns the long canonical forms
+        (None/Faint/Medium) which the model was never trained on either — so it
+        is deliberately NOT used here.
+        """
+        from ..reporting.price_file import _FLUOR_MAP
+        s = str(v or "").strip()
+        if not s:
+            return "Non"
+        return _FLUOR_MAP.get(s.upper(), s)
+
 
 class PricingService:
     # DEFAULT use_feedback=False. It used to default to True, which is the
