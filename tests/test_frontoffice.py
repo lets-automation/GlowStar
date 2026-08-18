@@ -328,3 +328,38 @@ def test_the_stone_is_never_hardcoded_away(client):
     assert last["shape_full"] == "Round", "the stone was overwritten"
     assert float(last["weight"]) == 1.01
     assert last["color"] == "G" and last["clarity"] == "VS1"
+
+
+def test_a_stone_priced_today_resolves_before_it_reaches_the_snapshot():
+    """PRODUCTION, 2026-08-14/17: 43 desk corrections stored untrainable.
+
+    resolve_stone only consulted records.json, which is rebuilt ONCE A DAY at
+    02:35. The desk prices and corrects stones the same day they enter
+    inventory, so corrections arriving at 16:13 and 16:37 were for stones absent
+    from that morning's snapshot. Checking the next day showed them present,
+    which made the lookup look correct while it was asking a source up to 24h
+    stale. The quotes table cannot have this problem: we wrote the row when we
+    priced the stone, seconds earlier.
+    """
+    from glowstar.store.db import record_quote
+    from glowstar.service.frontoffice import resolve_stone
+
+    sid, cert = "SNAPSHOT-LAG-1", "9990001112"
+    assert resolve_stone(cert, sid) is None, "precondition: unknown stone"
+
+    record_quote(facts={"suggested_discount": -47.0},
+                 stone={"StoneId": sid, "CertificateNo": cert,
+                        "Shape_full": "Round", "Weight": 0.33,
+                        "Color": "F", "Clarity": "VVS1"},
+                 model_version="test", source="frontoffice")
+
+    for got in (resolve_stone(None, sid), resolve_stone(cert, None)):
+        assert got is not None, "a stone we just priced must resolve"
+        assert got["shape_full"] == "Round" and got["weight"] == 0.33
+        assert got["color"] == "F" and got["clarity"] == "VVS1"
+
+
+def test_resolution_still_returns_none_for_a_stone_we_never_priced():
+    """External goods are legitimate — we must not invent attributes."""
+    from glowstar.service.frontoffice import resolve_stone
+    assert resolve_stone("never-quoted-cert-123", "never-quoted-id-123") is None

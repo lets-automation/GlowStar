@@ -158,6 +158,36 @@ def resolve_stone(certificate_no: str | None, stone_id: str | None) -> dict | No
     case, and the caller must then record the record as unattributable rather
     than invent values for it.
     """
+    # 1. OUR OWN QUOTES FIRST. We priced this stone moments ago, so its
+    #    attributes are in the audit trail and are always current.
+    #
+    #    records.json alone was not enough and the reason is subtle: it is
+    #    rebuilt ONCE A DAY at 02:35, while the desk prices and corrects stones
+    #    the same day they enter inventory. Real corrections arrived at 16:13
+    #    and 16:37 on stones that were not in that morning's snapshot, so every
+    #    one of them failed to resolve and was stored untrainable. Checking the
+    #    next morning showed the stones present, which made the lookup look
+    #    correct when it was simply asking a source up to 24h behind.
+    try:
+        from sqlalchemy import select, desc
+        from ..store.db import get_engine, quotes
+        for col, val in ((quotes.c.certificate_no, certificate_no),
+                         (quotes.c.stone_id, stone_id)):
+            if not val:
+                continue
+            with get_engine().connect() as c:
+                row = c.execute(
+                    select(quotes).where(col == str(val))
+                    .order_by(desc(quotes.c.ts)).limit(1)).mappings().first()
+            if row and row["shape"] and float(row["weight"] or 0) > 0:
+                return {"shape_full": str(row["shape"]),
+                        "weight": float(row["weight"]),
+                        "color": str(row["color"] or "NA"),
+                        "clarity": str(row["clarity"] or "NA")}
+    except Exception:
+        log.exception("quote lookup failed for %s / %s", certificate_no, stone_id)
+
+    # 2. Fall back to the inventory snapshot (covers a stone we never priced).
     try:
         from ..data.loaders import load_records
         df, _ = load_records()
