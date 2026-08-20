@@ -423,7 +423,10 @@ def test_shape_codes_canonicalise_to_trained_names():
     for raw, want in [("RBC", "Round"), ("ROUND", "Round"), ("round", "Round"),
                       ("BR", "Round"), ("OB", "Oval"), ("F.OVAL", "Oval"),
                       ("PB", "Pear"), ("MB", "Marquise"), ("HB", "Heart"),
-                      ("EM", "Emerald"), ("CCRMB", "Radiant")]:
+                      ("EM", "Emerald"),
+                      # CCRMB -> the name the model TRAINED on. "Radiant" has
+                      # zero training rows; this was a silent drop.
+                      ("CCRMB", "Cut-Cornered Rectangular")]:
         assert normalize_shape(raw) == want, f"{raw!r} -> {normalize_shape(raw)!r}"
 
 
@@ -507,7 +510,9 @@ def test_cps_keeps_a_lesser_make_lesser():
 
 def test_normalize_cps_is_idempotent_and_fails_to_NA():
     from glowstar.reference.normalize import normalize_cps
-    for canonical in ("3EX", "EX", "VG", "GD", "FR", "PR", "NA"):
+    # "PR" is deliberately absent: the model has never seen it, so POOR maps to
+    # FR (the worst trained grade) rather than emitting an unseen category.
+    for canonical in ("3EX", "EX", "VG", "GD", "FR", "NA"):
         assert normalize_cps(canonical) == canonical, canonical
     # Unknown input must become "no cut information", never a flattering guess.
     for junk in (None, "", "   ", "nan", "wibble", "-"):
@@ -695,3 +700,68 @@ def test_fluorescence_actually_changes_the_price():
     assert len({non, med, stg}) == 3, (
         f"fluorescence is being ignored again: NON={non} MED={med} STG={stg}")
     assert non > med > stg, "stronger fluorescence must price deeper"
+
+
+# --- THE BIDIRECTIONAL GUARD ------------------------------------------------
+# Every normalisation bug in this project — shape (10 Aug), CPS (10 Aug),
+# fluorescence short codes (17 Aug), fluorescence long forms + RADIANT (20 Aug) —
+# is the same defect, and the existing tests could never catch it because they
+# are ONE-DIRECTIONAL: they assert every TRAINED value survives normalisation.
+#
+# Nothing asserted the converse: that every OUTPUT a boundary normaliser can
+# produce is a value the model was actually trained on. `normalize_shape`
+# happily emitted "Radiant" (0 training rows) and `_FLUOR_MAP` happily passed
+# "Medium" straight through. HistGradientBoosting routes an unseen category as
+# MISSING — no error, no warning, no flag — so the signal simply vanishes.
+#
+# These two tests assert the PROPERTY. They will fail for a bug nobody has seen
+# yet, which is the whole point.
+
+def _trained_vocab(col: str) -> set[str]:
+    from glowstar.data.loaders import load_records, sold_stones
+    sold = sold_stones(load_records()[0], drop_outliers=True)
+    return {str(v) for v in sold[col].dropna().unique()}
+
+
+def test_no_normaliser_can_emit_a_value_the_model_never_saw():
+    """Every reachable OUTPUT must exist in the training vocabulary."""
+    from glowstar.reference.normalize import _SHAPE_FULL, _CPS_TRAINED
+    from glowstar.reporting.price_file import _FLUOR_MAP
+
+    problems = {}
+    for name, col, outputs in (
+        ("shape", "Shape_full", set(_SHAPE_FULL.values())),
+        ("fluorescence", "Fluorescence", set(_FLUOR_MAP.values())),
+        ("cps", "CPS", _CPS_TRAINED - {"NA"}),   # NA = deliberate "no cut info"
+    ):
+        trained = _trained_vocab(col)
+        unseen = {v for v in outputs if v not in trained}
+        if unseen:
+            problems[name] = sorted(unseen)
+    assert not problems, (
+        f"normalisers emit values the model was never trained on: {problems}. "
+        "HistGradientBoosting drops these silently — no error, no flag.")
+
+
+def test_documented_spellings_actually_reach_the_model():
+    """INTEGRATION.md promises these work. They must, or we are lying in writing."""
+    from glowstar.service.pricing_service import StoneIn
+
+    fl = _trained_vocab("Fluorescence")
+    sh = _trained_vocab("Shape_full")
+
+    broken = []
+    for v in ("NON", "None", "FNT", "Faint", "MED", "Medium",
+              "STG", "Strong", "VSTG", "Very Strong"):
+        got = StoneIn(Shape_full="RBC", Weight=1.0, Color="G",
+                      Clarity="VS1", Fluorescence=v).Fluorescence
+        if got not in fl:
+            broken.append(("fluorescence", v, got))
+
+    for v in ("RBC", "ROUND", "OB", "PB", "MB", "HB", "EM", "CCRMB", "RADIANT"):
+        got = StoneIn(Shape_full=v, Weight=1.0, Color="G",
+                      Clarity="VS1").Shape_full
+        if got not in sh:
+            broken.append(("shape", v, got))
+
+    assert not broken, f"INTEGRATION.md promises these and they are dropped: {broken}"

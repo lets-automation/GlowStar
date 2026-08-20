@@ -344,7 +344,11 @@ def test_a_stone_priced_today_resolves_before_it_reaches_the_snapshot():
     from glowstar.store.db import record_quote
     from glowstar.service.frontoffice import resolve_stone
 
-    sid, cert = "SNAPSHOT-LAG-1", "9990001112"
+    # UNIQUE per run: this test WRITES a quote, so a fixed id makes the second
+    # run find the stone already present and fail its own precondition.
+    import uuid
+    tag = uuid.uuid4().hex[:10]
+    sid, cert = f"SNAPSHOT-LAG-{tag}", f"999{tag}"
     assert resolve_stone(cert, sid) is None, "precondition: unknown stone"
 
     record_quote(facts={"suggested_discount": -47.0},

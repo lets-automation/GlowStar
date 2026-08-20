@@ -37,8 +37,34 @@ _SHAPE_MAP = {
     "cut-cornered rectangular modified brilliant": "Radiant",
     "square emerald cut": "Sq. Emerald",
 }
-_FLUOR_MAP = {"NON": "Non", "FNT": "Fnt", "MED": "Med", "STG": "Stg",
-              "VSL": "Vsl", "SLT": "Slt", "VSTG": "Vstg"}
+# EVERY spelling that reaches this system, mapped to the SEVEN values the model
+# was actually trained on: Non / Fnt / Med / Stg / Vstg / Slt / Vsl.
+#
+# The long words are not optional extras — they are what GIA prints on the
+# certificate, and INTEGRATION.md explicitly promises Glow Star IT that
+# "NON/None, FNT/Faint, MED/Medium, STG/Strong, VSTG/Very Strong" all work.
+# They did not: the short codes mapped, the long words passed through unchanged,
+# hit an unseen category, and HistGradientBoosting silently routed them as
+# MISSING. A 0.33 F/VVS1 priced -44.24 as "Non" and -51.22 as "None" — a
+# 17.2-point signal flattened, with no error and no flag.
+#
+# The client reported this symptom once already ("flo is diff still ai price is
+# same for all"). It was fixed for the short codes only, so it came straight
+# back through the spellings the documentation guarantees. Keys are uppercased
+# before lookup, so entries here are written uppercase.
+_FLUOR_MAP = {
+    # trade codes (the client's inventory feed)
+    "NON": "Non", "FNT": "Fnt", "MED": "Med", "STG": "Stg",
+    "VSL": "Vsl", "SLT": "Slt", "VSTG": "Vstg",
+    # long forms — what the GIA certificate says, and what INTEGRATION.md promises
+    "NONE": "Non", "FAINT": "Fnt", "MEDIUM": "Med", "STRONG": "Stg",
+    "VERY STRONG": "Vstg", "VERY SLIGHT": "Vsl", "SLIGHT": "Slt",
+    "VERYSTRONG": "Vstg", "VERY-STRONG": "Vstg",
+    # UNI market feed single letters
+    "N": "Non", "F": "Fnt", "M": "Med", "S": "Stg", "VS": "Vstg",
+    # already-canonical values must survive a second pass (idempotence)
+    "FN": "Fnt", "NIL": "Non", "NO": "Non",
+}
 
 
 def _shape_full(desc: str) -> str:

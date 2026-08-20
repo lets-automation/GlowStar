@@ -123,8 +123,21 @@ _SHAPE_FULL: dict[str, str] = {
     "EMERALD": "Emerald", "EM": "Emerald", "EB": "Emerald", "EC": "Emerald",
     "PRINCESS": "Princess", "PR": "Princess", "SMB": "Princess",
     "CUSHION": "Cushion", "CB": "Cushion", "CU": "Cushion", "CMB": "Cushion",
-    "RADIANT": "Radiant", "CCRMB": "Radiant", "RA": "Radiant", "CCSMB": "Radiant",
-    "RMB": "Radiant",
+    # RADIANT -> "Cut-Cornered Rectangular", NOT "Radiant".
+    # "Radiant" has ZERO training rows; the name the client's inventory uses, and
+    # therefore the name the model learned, is "Cut-Cornered Rectangular" (183
+    # rows). Pointing these at "Radiant" sent every radiant to an unseen category:
+    # the same stone priced -57.82 under the inventory name and -54.50 under the
+    # trade code, a 3.3-point spread decided purely by which spelling arrived.
+    "RADIANT": "Cut-Cornered Rectangular", "CCRMB": "Cut-Cornered Rectangular",
+    "RA": "Cut-Cornered Rectangular", "CCSMB": "Cut-Cornered Rectangular",
+    "RMB": "Cut-Cornered Rectangular",
+    "CUT-CORNERED RECTANGULAR": "Cut-Cornered Rectangular",
+    "CUT CORNERED RECTANGULAR": "Cut-Cornered Rectangular",
+    # Cushion variants are DISTINCT trained levels (Cushion Long 43, Cushion
+    # Brilliant 19, Cushion 15) — uppercase input must land on the exact spelling.
+    "CUSHION LONG": "Cushion Long", "CUSHION BRILLIANT": "Cushion Brilliant",
+    "CUSHION MODIFIED BRILLIANT": "Cushion Brilliant",
     "SQ. EMERALD": "Sq. Emerald", "SQ.EMERALD": "Sq. Emerald",
     "SQ EMERALD": "Sq. Emerald", "SQEM": "Sq. Emerald", "SEM": "Sq. Emerald",
     "SE": "Sq. Emerald",
@@ -149,7 +162,13 @@ _CPS_GRADE: dict[str, str] = {
     "VERY GOOD": "VG", "VERYGOOD": "VG", "VG": "VG", "V.GOOD": "VG",
     "GOOD": "GD", "GD": "GD", "G": "GD",
     "FAIR": "FR", "FR": "FR", "F": "FR",
-    "POOR": "PR", "PR": "PR", "P": "PR",
+    # POOR -> "FR", not "PR". The model has never seen "PR": the trained CPS
+    # vocabulary is {3EX, EX, VG, GD, FR, VG-GD}. Emitting "PR" produced an
+    # unseen category that HistGradientBoosting drops silently, so a Poor-cut
+    # stone lost its cut signal entirely. FR is the worst grade the model
+    # actually knows, which is the closest honest answer. Found by the
+    # bidirectional guard, not by anyone noticing.
+    "POOR": "FR", "PR": "FR", "P": "FR",
 }
 
 # Whole-string spellings of triple-excellent that carry no separators to split on.
@@ -168,7 +187,7 @@ _TRIPLE_EX = {"3EX", "3X", "XXX", "EXEXEX", "TRIPLEEX", "TRIPLEEXCELLENT", "3EXC
 # So: combinations that the model has actually SEEN are preserved; combinations
 # it has never seen still collapse to the cut grade, because an unseen category
 # is what caused the original bug.
-_CPS_TRAINED = {"3EX", "EX", "VG", "GD", "FR", "PR", "VG-GD"}
+_CPS_TRAINED = {"3EX", "EX", "VG", "GD", "FR", "VG-GD"}
 
 
 def normalize_cps(raw: str | None) -> str:
