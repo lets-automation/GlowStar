@@ -39,6 +39,23 @@ _CANON_SHAPE: dict[str, str] = {
     "SQUARE EMERALD": "SQ.EMERALD", "SQ. EMERALD": "SQ.EMERALD",
     "SQ EMERALD": "SQ.EMERALD", "SQEM": "SQ.EMERALD",
     "PRINCESS": "PRINCESS", "CUSHION": "CUSHION", "RADIANT": "RADIANT",
+    # THE INVENTORY'S OWN NAMES. The grid carries a RADIANT sheet (16,032 cells)
+    # and a CUSHION sheet (14,112), but the client's inventory calls those stones
+    # "Cut-Cornered Rectangular", "Cushion Long" and "Cushion Brilliant". With no
+    # entry here canon_shape returned None, so 343 live stones could never reach a
+    # cell that existed all along — landing in the no-cell bucket, which is the
+    # worst in the system (MAE 4.97, band holds 68%).
+    #
+    # This is the same defect as the model-side shape map, on the other side of
+    # the boundary: the cells were there, the spelling wasn't.
+    "CUT-CORNERED RECTANGULAR": "RADIANT",
+    "CUT CORNERED RECTANGULAR": "RADIANT",
+    "CUT-CORNERED RECTANGULAR MODIFIED BRILLIANT": "RADIANT",
+    "RECTANGULAR MODIFIED BRILLIANT": "RADIANT",
+    "CCRMB": "RADIANT", "CCSMB": "RADIANT", "RMB": "RADIANT",
+    "CUSHION LONG": "CUSHION", "CUSHION BRILLIANT": "CUSHION",
+    "CUSHION MODIFIED BRILLIANT": "CUSHION", "CMB": "CUSHION", "CB": "CUSHION",
+    "DECA BRI": "DECAGONAL",
     "BAGUETTE": "BAGUETTE",
     "DECAGONAL": "DECAGONAL", "DECAGONAL BRILLIANT": "DECAGONAL",
     "CARRE": "CARRE", "CARRE CUT": "CARRE",

@@ -106,6 +106,30 @@ class EngineConfig:
     #     split 06-20:  7d -> 2.364   30d -> 2.049   (short loses)
     # Do not tune this on a single split.
     recency_half_life: float = 30.0
+    # FORWARD-DRIFT CORRECTION horizon, in days. 0 = OFF.
+    #
+    # OFF is measured, not assumed. The correction estimates how stale the model
+    # gets over `bias_inner_days` and shifts every price by that amount. It was
+    # calibrated at 45 days, which matched the old deployment: a laptop whose
+    # nightly job missed 43% of runs, so the served model really was weeks stale.
+    #
+    # Production now retrains EVERY NIGHT on an always-on server. The model is one
+    # day old, so the correction compensates for six weeks of drift that never
+    # happens — and it now pushes the wrong way: the engine runs 0.60 too DEEP and
+    # the correction deepens it further.
+    #
+    # A/B on five rolling origins, one engine fit per origin, arms differing only
+    # by this switch (n=4,471 held-out sales):
+    #     ON   MAE 1.9938   +/-2 64.4%   bias -0.60
+    #     OFF  MAE 1.8297   +/-2 69.1%   bias +0.40      <- -0.164 MAE, +4.7pt
+    # OFF won at all five origins. An independent audit measured -0.206 on nine
+    # different origins; same direction, same size.
+    #
+    # The MECHANISM is not wrong, its horizon is. Do NOT delete the code: if the
+    # market turns and the model goes stale-shallow again, set this to a horizon
+    # that matches production (7-10 days), key it per shape, and let the promotion
+    # gate choose between the two nightly.
+    bias_inner_days: int = 0
     min_segment_samples: int = SETTINGS.min_segment_samples
     # Per-segment asking->realized offset: own calibration for liquid segments,
     # shrunk to the global offset by sample size for thin ones.
@@ -396,6 +420,9 @@ class PricingEngine:
         Thin families are shrunk toward the global estimate by sample size, so a
         sparse family cannot chase noise.
         """
+        if not int(getattr(self.cfg, "bias_inner_days", 0)):
+            return {}                      # OFF by default — see EngineConfig
+        inner_days = int(self.cfg.bias_inner_days)
         if "OrderDate_dt" not in train.columns or self.gbm is None:
             return {}
         cut = train["OrderDate_dt"].max() - pd.Timedelta(days=inner_days)

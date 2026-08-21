@@ -208,3 +208,43 @@ def test_api_key_is_enforced_when_configured(tmp_path, monkeypatch):
                   headers={"X-API-Key": "secret123"}).status_code == 200
     # health stays open so a load balancer can probe it
     assert c.get("/health").status_code == 200
+
+
+# --- a stone we cannot price must not take down the whole run ---------------
+# PRODUCTION, 2026-08-21: the client selected 595 stones. Two were "Fancy Intense
+# Yellow", which has no cell on the white D-N Rapaport list, so the lookup raised
+# and /price returned a bare 500. Their CRM rendered it as `[object Object]` and
+# abandoned the entire run — 593 priceable stones lost to two yellows.
+
+def test_fancy_colour_returns_a_structured_422_not_a_500(monkeypatch):
+    from fastapi.testclient import TestClient
+    from glowstar.service import app as app_mod
+    monkeypatch.delenv("GS_API_KEY", raising=False)
+    c = TestClient(app_mod.app)
+    r = c.post("/price", json={"Shape_full": "Cushion", "Weight": 1.03,
+                               "Color": "Fancy Intense Yellow", "Clarity": "VVS2"})
+    assert r.status_code == 422, "an unpriceable stone must not be a server error"
+    d = r.json()["detail"]
+    assert d["error"] == "not_priceable"
+    # the caller must be told WHICH stone and WHY, or they cannot skip it
+    assert d["color"] == "Fancy Intense Yellow"
+    assert "white" in d["message"].lower()
+    assert "frontoffice" in d["hint"]
+
+
+def test_a_batch_survives_a_stone_it_cannot_price(monkeypatch):
+    """The other 593 must still come back."""
+    from fastapi.testclient import TestClient
+    from glowstar.service import app as app_mod
+    monkeypatch.delenv("GS_API_KEY", raising=False)
+    c = TestClient(app_mod.app)
+    r = c.post("/frontoffice/price", json=[
+        {"stoneId": "FANCY", "shape": "Cushion", "weight": 1.03,
+         "color": "Fancy Intense Yellow", "clarity": "VVS2"},
+        {"stoneId": "WHITE", "shape": "RBC", "weight": 0.33,
+         "color": "F", "clarity": "VVS1", "fluorescence": "NON"},
+    ])
+    assert r.status_code == 200
+    rows = {x["StoneId"]: x for x in r.json()}
+    assert rows["FANCY"]["AIDiscount"] is None and rows["FANCY"]["Error"]
+    assert rows["WHITE"]["AIDiscount"] is not None, "a good stone must still price"

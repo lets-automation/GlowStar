@@ -272,8 +272,35 @@ if FastAPI is not None:
 
     @app.post("/price", dependencies=[Depends(require_key)])
     def price(stone: StoneIn) -> dict:
-        """Price one stone: suggestion, interval, comparables, flags, explanation."""
-        return _audit(_get_service().price(stone), stone, "api")
+        """Price one stone: suggestion, interval, comparables, flags, explanation.
+
+        A stone we CANNOT price returns a structured 422, never a 500.
+
+        Fancy-colour and cape stones ("Fancy Intense Yellow") have no cell on the
+        white D-N Rapaport list, so the lookup raises. Unhandled, that surfaced in
+        the client's CRM as a bare `[object Object]` dialog which aborted a whole
+        595-stone run — 593 perfectly priceable stones lost to two yellows.
+        A 422 with the stone named lets the CRM skip it and carry on.
+
+        We deliberately do NOT invent a number for these. The model is trained on
+        white goods priced off the white list; a fancy colour has neither, and a
+        plausible-looking price for a stone we cannot price is worse than a clear
+        refusal.
+        """
+        try:
+            return _audit(_get_service().price(stone), stone, "api")
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "not_priceable",
+                        "stone_id": stone.StoneId or None,
+                        "shape": stone.Shape_full, "weight": stone.Weight,
+                        "color": stone.Color, "clarity": stone.Clarity,
+                        "message": str(e),
+                        "hint": "Fancy/cape colours have no white Rapaport cell. "
+                                "Use /frontoffice/price for batches — it returns a "
+                                "per-stone Error and never fails the whole book."},
+            ) from None
 
     @app.post("/price/batch", dependencies=[Depends(require_key)])
     def price_batch(stones: list[StoneIn]) -> dict:

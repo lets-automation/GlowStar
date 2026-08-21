@@ -765,3 +765,40 @@ def test_documented_spellings_actually_reach_the_model():
             broken.append(("shape", v, got))
 
     assert not broken, f"INTEGRATION.md promises these and they are dropped: {broken}"
+
+
+# --- F5: the forward-drift correction is OFF, and that is measured ----------
+# It estimated how stale the model gets over 45 days and shifted every price by
+# that much. Correct when the nightly job ran on a laptop that missed 43% of its
+# runs; wrong now that production retrains every night on an always-on server —
+# it corrects for six weeks of drift that never happens, and pushes the same way
+# the engine is already wrong (bias -0.60).
+#
+# A/B, five rolling origins, identical fits, n=4,471:
+#     ON   MAE 1.9938  +/-2 64.4%  bias -0.60
+#     OFF  MAE 1.8297  +/-2 69.1%  bias +0.40
+# OFF won at every origin.
+
+def test_forward_drift_correction_is_off_by_default():
+    from glowstar.models.engine import EngineConfig
+    assert EngineConfig().bias_inner_days == 0, (
+        "the forward-drift correction is calibrated for 45 days of staleness that "
+        "nightly retraining never produces — measured at -0.164 MAE when off")
+
+
+def test_the_gate_scores_the_correction_setting_that_ships():
+    """Trap 5: if it is not in serving_config, the gate scores a different engine."""
+    from glowstar.training.retrain import serving_config
+    from glowstar.models.engine import EngineConfig
+    assert serving_config("2026-06-01").bias_inner_days == EngineConfig().bias_inner_days
+
+
+def test_correction_returns_nothing_when_disabled_and_can_be_re_enabled():
+    """The mechanism must survive, switched off — not be deleted."""
+    from glowstar.models.engine import PricingEngine, EngineConfig
+    eng = PricingEngine(EngineConfig())
+    assert eng._fit_bias_correction(pd.DataFrame()) == {}      # off: no work done
+    eng.cfg.bias_inner_days = 45
+    # re-enabled it reaches the real guard (no gbm yet) rather than the switch
+    assert eng._fit_bias_correction(pd.DataFrame()) == {}
+    assert hasattr(eng, "_fit_bias_correction"), "the mechanism must not be deleted"
