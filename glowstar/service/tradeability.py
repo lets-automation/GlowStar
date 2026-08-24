@@ -6,6 +6,25 @@ real number to bind to; the full velocity engine (Workstream B) is a larger buil
 — survival model with intervals, own-vs-market separation, GMROI-optimised
 repricing — and is not what this module claims to be.
 
+THE CLOCK: durations run from `MarketSheetDate`, never `CreatedDate`
+-------------------------------------------------------------------
+`Ageing` IS the client's own days-to-sell clock, and its origin is the market
+sheet date. Measured on the live book, the identity is exact, not approximate:
+
+    Sold  stones:  Ageing == (OrderDate    - MarketSheetDate)   100% of rows
+    Stock stones:  Ageing == (snapshot_date - MarketSheetDate)  100% of rows
+
+`AvailableDays` is a DIFFERENT quantity (~38% / ~61% agreement) — do not treat the
+two as interchangeable. `CreatedDate` is not the clock either: it sits earlier than
+`MarketSheetDate` on ~96% of stock, so measuring from it counts days before the
+stone was ever offered and reports the desk as slower than they are.
+
+This module used `CreatedDate` until 2026-08-24. Re-verify the identity with:
+
+    python -c "import pandas as pd; from glowstar.data.loaders import load_records; \
+df,_=load_records(); d=df[df.Status=='Sold']; \
+print((pd.to_numeric(d.Ageing,errors='coerce')-(d.OrderDate_dt-d.MarketSheetDate_dt).dt.days).abs().eq(0).mean())"
+
 TWO BIASES, IN OPPOSITE DIRECTIONS — both must be corrected
 ------------------------------------------------------------
 1. RIGHT-CENSORING (makes it look too FAST).
@@ -16,7 +35,7 @@ TWO BIASES, IN OPPOSITE DIRECTIONS — both must be corrected
 
 2. LEFT-TRUNCATION (makes it look too SLOW) — the subtler one, and it bit us.
    The sale records only begin 2025-12-18, but stock still contains stones
-   created years earlier. Those ancient stones are kept as slow survivors, while
+   listed years earlier. Those ancient stones are kept as slow survivors, while
    their contemporaries that entered AND SOLD before the window are absent from
    the record set entirely. Survivors in, successes out.
 
@@ -115,25 +134,25 @@ def build_table(force: bool = False) -> _Table:
         from ..data.loaders import load_records
 
         df, _ = load_records()
-        for c in ("CreatedDate_dt", "OrderDate_dt"):
+        for c in ("MarketSheetDate_dt", "OrderDate_dt"):
             if c not in df.columns:
                 df[c] = pd.to_datetime(df[c.replace("_dt", "")], errors="coerce",
                                        utc=True).dt.tz_localize(None)
         now = pd.Timestamp.now().normalize()
 
         sold = df[df["Status"] == "Sold"].copy()
-        sold["dur"] = (sold["OrderDate_dt"] - sold["CreatedDate_dt"]).dt.days
+        sold["dur"] = (sold["OrderDate_dt"] - sold["MarketSheetDate_dt"]).dt.days
         sold["obs"] = True
 
-        # CENSORED: still in stock. Duration so far = today - created.
+        # CENSORED: still in stock. Duration so far = today - listed.
         stock = df[df["Status"] == "Stock"].copy()
-        stock["dur"] = (now - stock["CreatedDate_dt"]).dt.days
+        stock["dur"] = (now - stock["MarketSheetDate_dt"]).dt.days
         stock["obs"] = False
 
         both = pd.concat([sold, stock], ignore_index=True)
 
         # LEFT-TRUNCATION GUARD: keep only stones that entered stock inside the
-        # window our sale records actually cover. A stone created before the first
+        # window our sale records actually cover. A stone listed before the first
         # recorded sale is kept in `stock` if it never sold, but its
         # contemporaries that DID sell back then are missing from the records —
         # so including it counts survivors without their successes and inflates
@@ -141,7 +160,7 @@ def build_table(force: bool = False) -> _Table:
         window_start = sold["OrderDate_dt"].min()
         if pd.notna(window_start):
             before = len(both)
-            both = both[both["CreatedDate_dt"] >= window_start]
+            both = both[both["MarketSheetDate_dt"] >= window_start]
             dropped = before - len(both)
             if dropped:
                 log.info("Tradeability: excluded %d stones that entered stock before "

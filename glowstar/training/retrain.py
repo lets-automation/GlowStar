@@ -34,6 +34,44 @@ from ..validation import metrics as M
 
 log = logging.getLogger(__name__)
 
+# THE GATE'S HORIZON, in days — how far ahead the candidate must predict.
+#
+# 7, because that is what production faces. The gate used to train on everything
+# before a FIXED split (2026-06-01) and score every sale after it, i.e. a model
+# frozen in June predicting up to twelve weeks ahead. Production retrains EVERY
+# NIGHT and prices the next day. Those are different questions and they do not
+# even rank changes the same way:
+#
+#     forward-drift correction OFF:  7-day horizon 1.83  |  12-week horizon 2.59
+#     forward-drift correction ON :  7-day horizon 1.99  |  12-week horizon 2.33
+#
+# A staleness correction helps a stale model and hurts a fresh one, so the two
+# protocols disagree about which model is better. Scoring the long horizon made
+# the gate reject the configuration that was measurably BETTER for the client
+# (realized MAE on actual sales: 2.48 -> 1.44 the week it shipped).
+#
+# CLAUDE.md Trap 5, one more time: measure the path that SHIPS.
+GATE_HORIZON_DAYS = 7
+
+# Identifies WHICH question `test_mae` answers, stamped on every card. Bump this
+# whenever the protocol changes, so `best_mae()` cannot compare across the change
+# — that near-miss is documented in registry.best_mae.
+METRIC_PROTOCOL = f"rolling{GATE_HORIZON_DAYS}d.v1"
+
+
+def gate_split(sold, horizon_days: int = GATE_HORIZON_DAYS):
+    """Train on everything up to `horizon_days` ago; test on that window.
+
+    Mirrors production: a model fitted last night pricing today's stones. Returns
+    (train, test, origin).
+    """
+    import pandas as _pd
+    d = sold.copy()
+    d["OrderDate_dt"] = _pd.to_datetime(d["OrderDate_dt"])
+    origin = d["OrderDate_dt"].max() - _pd.Timedelta(days=horizon_days)
+    return d[d["OrderDate_dt"] < origin], d[d["OrderDate_dt"] >= origin], origin
+
+
 # A candidate may be at most this many MAE points worse than the INCUMBENT and
 # still be promoted (small wiggle for run-to-run noise). Configurable.
 PROMOTE_TOLERANCE_PTS = 0.25
@@ -221,7 +259,10 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
                  len(fbstore.load_all()))
 
     # 3. Candidate evaluated out-of-time (honest, leakage-free).
-    train, test, info = time_split(sold, split_date)
+    # PRODUCTION HORIZON, not a fixed twelve-week split — see GATE_HORIZON_DAYS.
+    train, test, origin = gate_split(sold)
+    log.info("gate protocol: %s | train %d (< %s) | test %d (next %dd)",
+             METRIC_PROTOCOL, len(train), origin.date(), len(test), GATE_HORIZON_DAYS)
     cand_eval = PricingEngine(serving_config(split_date)).fit(
         train, feedback_records=feedback)
     metrics = _evaluate(cand_eval, test) if len(test) else {
@@ -229,10 +270,24 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
 
     # 4. Promotion gate vs the incumbent.
     _, incumbent = registry.load_current()
-    inc_mae = (incumbent or {}).get("test_mae")
+    # The INCUMBENT's number is only comparable if it answers the same question.
+    # After a protocol change its card holds a figure measured a different way;
+    # using it would repeat exactly the mistake this change exists to fix. Treat
+    # a mismatched incumbent as "no incumbent" — the first model under a new
+    # protocol establishes the baseline, and the ceiling still backstops it.
+    inc_mae = None
+    if incumbent:
+        if incumbent.get("metric_protocol") == METRIC_PROTOCOL:
+            inc_mae = incumbent.get("test_mae")
+        else:
+            log.warning(
+                "incumbent %s was scored under protocol %r, not %r — its MAE is "
+                "not comparable, so this candidate sets a fresh baseline.",
+                incumbent.get("version"), incumbent.get("metric_protocol"),
+                METRIC_PROTOCOL)
     # The best MAE ever recorded — a reference point that cannot drift upward.
     # Without it the gate is a ratchet; see gate_decision.
-    best = registry.best_mae()
+    best = registry.best_mae(protocol=METRIC_PROTOCOL)
     promote, reason = gate_decision(metrics["mae"], inc_mae, best, tolerance)
     if best is not None and metrics["mae"] is not None:
         log.info("gate: candidate %.3f | incumbent %s | best ever %.3f | drift %+.3f",
@@ -246,7 +301,8 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
         version=version, trained_at=datetime.now().isoformat(timespec="seconds"),
         n_train=len(sold), test_mae=metrics["mae"],
         test_within2=metrics.get("within2"), test_within5=metrics["within5"],
-        test_coverage=metrics["coverage"], promoted=promote, notes=reason)
+        test_coverage=metrics["coverage"], promoted=promote, notes=reason,
+        metric_protocol=METRIC_PROTOCOL)
     registry.save_engine(prod, card)
     if promote:
         registry.set_current(version)

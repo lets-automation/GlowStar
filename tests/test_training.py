@@ -205,3 +205,63 @@ def test_gate_evaluates_with_point_in_time_grid():
     assert seen["asof"] is None, (
         f"_evaluate pinned the grid to {seen['asof']!r}; it must pass no asof so "
         "each row sees the grid as it was on ITS OWN OrderDate")
+
+
+# --- the gate must score the horizon PRODUCTION faces -----------------------
+# It trained on everything before a FIXED split (2026-06-01) and scored every
+# sale after it — a model frozen in June predicting up to twelve weeks ahead.
+# Production retrains nightly and prices the next day. The two protocols do not
+# even RANK changes the same way:
+#     drift correction OFF: 7-day 1.83 | 12-week 2.59
+#     drift correction ON : 7-day 1.99 | 12-week 2.33
+# So the gate marked the configuration that was measurably better for the client
+# (realized MAE 2.48 -> 1.44) as a 0.25 regression, and the anti-ratchet was two
+# nights from freezing the model for it.
+
+def test_gate_split_is_the_production_horizon():
+    from glowstar.training.retrain import gate_split, GATE_HORIZON_DAYS
+    df = pd.DataFrame({
+        "OrderDate_dt": pd.to_datetime(
+            ["2026-01-01", "2026-06-01", "2026-08-01", "2026-08-12", "2026-08-13"]),
+        "FDiscount": [-50.0] * 5,
+    })
+    train, test, origin = gate_split(df)
+    assert origin == pd.Timestamp("2026-08-13") - pd.Timedelta(days=GATE_HORIZON_DAYS)
+    assert len(test) == 2, "test must be the last 7 days only"
+    assert train["OrderDate_dt"].max() < origin
+    assert len(train) + len(test) == len(df), "no row may be dropped or duplicated"
+
+
+def test_metric_protocol_is_stamped_and_tracks_the_horizon():
+    from glowstar.training.retrain import METRIC_PROTOCOL, GATE_HORIZON_DAYS
+    assert str(GATE_HORIZON_DAYS) in METRIC_PROTOCOL, (
+        "the protocol id must change when the horizon does, or best_mae() will "
+        "compare numbers that answer different questions")
+
+
+def test_best_mae_refuses_to_compare_across_protocols(tmp_path, monkeypatch):
+    """The near-miss: a config change moved the metric 0.25 and the anti-ratchet
+    read it as degradation, two nights from freezing a BETTER model."""
+    from glowstar.models import registry
+    import json
+    monkeypatch.setattr(registry, "MODELS_DIR", tmp_path)
+    for name, mae, proto in (("old1", 2.38, "fixedsplit"), ("old2", 2.64, "fixedsplit"),
+                             ("new1", 1.83, "rolling7d.v1")):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "metrics.json").write_text(
+            json.dumps({"test_mae": mae, "metric_protocol": proto}))
+
+    assert registry.best_mae(protocol="rolling7d.v1") == 1.83
+    assert registry.best_mae(protocol="fixedsplit") == 2.38
+    # unknown protocol -> no comparable history, so a clean baseline
+    assert registry.best_mae(protocol="rolling14d.v1") is None
+    # unfiltered still sees everything (back-compat for callers that do not care)
+    assert registry.best_mae() == 1.83
+
+
+def test_incumbent_from_another_protocol_is_not_used_as_the_bar():
+    import inspect
+    from glowstar.training import retrain as R
+    src = inspect.getsource(R.retrain)
+    assert 'metric_protocol") == METRIC_PROTOCOL' in src, (
+        "the incumbent's MAE must only be used when it answers the same question")

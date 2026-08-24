@@ -46,6 +46,11 @@ class ModelCard:
     test_coverage: float | None = None
     promoted: bool = False
     notes: str = ""
+    # WHICH QUESTION `test_mae` ANSWERS. Comparing a number across protocols is
+    # meaningless, and doing it silently is how the gate nearly froze the model:
+    # a config change moved the metric 0.25 and the anti-ratchet read that as
+    # degradation. Stamp the protocol; refuse to compare across it.
+    metric_protocol: str = "unknown"
 
 
 def _dump(obj, path: Path) -> None:
@@ -103,8 +108,15 @@ def load_current() -> tuple[object | None, dict | None]:
     return engine, card
 
 
-def best_mae() -> float | None:
-    """Lowest test MAE ever recorded across every saved model card.
+def best_mae(protocol: str | None = None) -> float | None:
+    """Lowest test MAE ever recorded — ONLY among cards using `protocol`.
+
+    Cards scored under a different protocol are excluded, not silently mixed in.
+    On 2026-08-21 a config change altered what `test_mae` measures; the stored
+    best (2.382) had been recorded under the old one, so the gate compared two
+    different questions and read the difference as the model degrading. Two more
+    nights and the anti-ratchet would have frozen a model that was in fact
+    performing BETTER in production (realized MAE 2.48 -> 1.44).
 
     The promotion gate needs a reference point that does NOT move upward. The
     incumbent's MAE is not that: it is replaced by every promotion, so gating on
@@ -124,9 +136,12 @@ def best_mae() -> float | None:
         if not f.exists():
             continue
         try:
-            mae = json.loads(f.read_text(encoding="utf-8")).get("test_mae")
+            card = json.loads(f.read_text(encoding="utf-8"))
         except Exception:      # a corrupt card must not break the retrain
             continue
+        if protocol is not None and card.get("metric_protocol") != protocol:
+            continue           # different question — not comparable
+        mae = card.get("test_mae")
         if isinstance(mae, (int, float)) and (best is None or mae < best):
             best = float(mae)
     return best
