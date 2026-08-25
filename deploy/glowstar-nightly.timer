@@ -2,7 +2,17 @@
 Description=Run the GlowStar nightly job
 
 [Timer]
-OnCalendar=*-*-* 02:30:00
+# TIMEZONE IS PINNED ON PURPOSE. Bare `02:30:00` means 02:30 in the SERVER's
+# local time, and this box runs UTC by default — which is 08:00 in India, the
+# exact moment the desk starts pricing its book. The retrain is the machine's
+# CPU and memory peak (full live rebuild + several GBM fits), so scheduling it
+# by accident into working hours starves the API and looks to the client like
+# "the pricing engine stops responding in the morning".
+#
+# Naming the zone makes the schedule independent of what `timedatectl` says, so
+# a rebuilt or migrated server cannot silently move the job back into the
+# working day. Requires systemd >= 252; Ubuntu 24.04 ships 255.
+OnCalendar=*-*-* 02:30:00 Asia/Kolkata
 # If the machine was down at 02:30, run on boot rather than skip a day — a
 # missed night means a stale grid, and grid freshness is the single biggest
 # accuracy lever we have measured (fresh cell 1.5 MAE vs 4.3 when 2 weeks old).

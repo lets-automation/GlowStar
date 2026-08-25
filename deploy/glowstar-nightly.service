@@ -17,4 +17,23 @@ ExecStart=/opt/glowstar/.venv/bin/python -m glowstar.training.retrain
 # Prefixed '-' so a monitoring failure can never fail the retrain that matters.
 ExecStart=-/opt/glowstar/.venv/bin/python -m glowstar.monitoring.drift
 ExecStart=/opt/glowstar/deploy/backup.sh
+# PICK UP THE MODEL WE JUST PROMOTED.
+#
+# `PricingService` loads the model ONCE per uvicorn worker and there is no
+# reload path, so a promoted model does not reach a running worker — it sits in
+# the registry, unserved, until something restarts the API. Nothing did. The
+# gate could report improving accuracy for weeks while the client was served
+# the model that happened to be current the last time the box rebooted, and
+# /health read the registry so it showed the new version either way.
+#
+# `+` runs this with full privileges rather than as User=glowstar. It is the
+# last step, so a failed retrain never bounces a working API.
+# --no-block: calling systemctl from inside a unit and WAITING on the job can
+# deadlock against systemd's own job queue. Queue the restart and exit.
+ExecStartPost=+/usr/bin/systemctl restart --no-block glowstar-api
 TimeoutStartSec=4h
+# Yield to the API. If this job ever overruns into working hours (a slow live
+# rebuild, a retry, a Persistent=true catch-up run after downtime), the desk
+# must still get prices — slowly retrained beats not answering.
+Nice=10
+IOSchedulingClass=idle

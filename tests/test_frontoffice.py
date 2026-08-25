@@ -41,6 +41,20 @@ class _FakeService:
             "comparable_count": 1763, "method": "model+anchor", "flags": [],
         }, "market": {}, "explanation": {"text": "1,763 comparable stones."}}
 
+    # Mirrors the REAL PricingService.price_many contract: one entry per stone,
+    # in order, and a stone that fails comes back AS an Exception rather than
+    # raising — that is what lets one bad stone cost only its own row.
+    # `test_price_many_returns_failures_it_does_not_raise_them` pins the real
+    # service to this same shape so the double cannot quietly drift from it.
+    def price_many(self, stones, *, explain=True):
+        out = []
+        for s in stones:
+            try:
+                out.append(self.price(s))
+            except Exception as e:      # noqa: BLE001 - contract is to return it
+                out.append(e)
+        return out
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):

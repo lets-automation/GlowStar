@@ -9,6 +9,8 @@ persistence, so these tests check the rows.
 
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 import pytest
 
 pytest.importorskip("sqlalchemy")
@@ -179,12 +181,34 @@ def test_rate_limit_tracking_dict_is_bounded(monkeypatch):
 # afterwards — and "what did you quote in March, and why?" is the first
 # question asked when a price is disputed (MOU audit requirement).
 
-def test_price_endpoints_are_wired_to_the_audit_trail():
-    import inspect
+def test_price_endpoints_are_wired_to_the_audit_trail(monkeypatch):
+    """BEHAVIOURAL. The first version of this test grepped app.py for the exact
+    call text `_audit(svc.price(s), s, "api-batch")`. That is not a test of the
+    audit trail, it is a test of one spelling: batching /price/batch into a
+    single `price_many` call broke it while auditing still worked perfectly,
+    and — far worse — it would have passed just as happily if `_audit` had been
+    deleted and replaced by a differently-named no-op. Assert that a ROW LANDS.
+    """
     from glowstar.service import app as A
-    src = inspect.getsource(A)
-    assert "_audit(_get_service().price(stone)" in src, "/price does not audit"
-    assert '_audit(svc.price(s), s, "api-batch")' in src, "/price/batch does not audit"
+    from glowstar.store import db
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(db, "record_quote",
+                        lambda **kw: recorded.append(kw) or 1)
+    monkeypatch.delenv("GS_API_KEY", raising=False)
+
+    stone = {"StoneId": "AUDIT-1", "Shape_full": "Round", "Weight": 0.9,
+             "Color": "G", "Clarity": "VS1", "CPS": "3EX", "Fluorescence": "Non"}
+    c = TestClient(A.app)
+
+    assert c.post("/price", json=stone).status_code == 200
+    assert any(r.get("stone", {}).get("StoneId") == "AUDIT-1" for r in recorded),         "/price published a price that left no audit row"
+
+    n_before = len(recorded)
+    r = c.post("/price/batch", json=[stone, dict(stone, StoneId="AUDIT-2")])
+    assert r.status_code == 200
+    ids = {rec.get("stone", {}).get("StoneId") for rec in recorded[n_before:]}
+    assert {"AUDIT-1", "AUDIT-2"} <= ids,         f"/price/batch published prices that left no audit row (saw {ids})"
 
 
 def test_audit_failure_never_costs_the_price(monkeypatch):

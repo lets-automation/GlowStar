@@ -160,9 +160,17 @@ class PricingService:
         self._rap_monitor = rap_monitor if rap_monitor is not None else RapChangeMonitor()
         # Prefer a gated, versioned model from the registry (fast start, audited)
         # over retraining in memory. The nightly retrain job promotes it.
+        # THE VERSION THIS PROCESS IS ACTUALLY SERVING. Not the same thing as the
+        # version on disk: the model is loaded ONCE per uvicorn worker and never
+        # reloaded, so after a nightly promotion the registry moves on and this
+        # worker keeps serving what it booted with. /health read the registry and
+        # reported the new version regardless — green, and wrong. Recording it
+        # here is what lets /health tell the truth about what is answering.
+        self.model_version: str | None = None
         if engine is None and prefer_registry:
             engine, card = registry.load_current()
             if engine is not None:
+                self.model_version = (card or {}).get("version")
                 log.info("Loaded live model %s from registry (test MAE=%s).",
                          (card or {}).get("version"), (card or {}).get("test_mae"))
         if engine is None:
@@ -229,6 +237,53 @@ class PricingService:
         if explain:
             out["explanation"] = narrate(facts)
         return out
+
+    def price_many(self, stones: list[StoneIn], *,
+                   explain: bool = True) -> list[dict | Exception]:
+        """Price a whole batch with ONE model call. Same answers as `price()`.
+
+        `price()` per stone runs a single-row `engine.predict()` each time —
+        measured at ~61 ms/stone. The engine's predict is already vectorised and
+        does 1,000 stones in ~0.6 s, so the loop was paying ~100x for nothing.
+        At 61 ms the documented 5,000-stone limit takes 5.1 minutes against
+        nginx's 300 s `proxy_read_timeout`: the advertised maximum request
+        exceeded the advertised timeout, so the client's biggest calls could fail.
+
+        Returns one entry per stone IN ORDER: the same dict `price()` returns, or
+        the Exception for that stone. A stone we cannot price (fancy colour, no
+        Rap cell) must never cost the rest of the book its prices — that failure
+        already cost a 595-stone run once.
+        """
+        results: list[dict | Exception] = [None] * len(stones)   # type: ignore[list-item]
+        frames, keep = [], []
+        for i, st in enumerate(stones):
+            try:
+                frames.append(self._to_frame(st))
+                keep.append(i)
+            except Exception as e:                 # per-stone, never fatal
+                results[i] = e
+        if not frames:
+            return results
+
+        df = pd.concat(frames, ignore_index=True)
+        suggestions = self.engine.predict(df)      # <- THE one model call
+        market = self._market_context()            # identical for every stone
+
+        for pos, i in enumerate(keep):
+            try:
+                facts = asdict(suggestions[pos])
+                facts["coverage_pct"] = int(self.engine.cfg.coverage * 100)
+                rap_change = self._apply_rap_change(
+                    facts, stones[i], float(df["Rap"].iloc[pos]))
+                out: dict = {"suggestion": facts, "market": market}
+                if rap_change is not None:
+                    out["rap_change"] = rap_change
+                if explain:
+                    out["explanation"] = narrate(facts)
+                results[i] = out
+            except Exception as e:
+                results[i] = e
+        return results
 
     def _apply_rap_change(self, facts: dict, stone: StoneIn,
                           rap: float) -> dict | None:

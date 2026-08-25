@@ -63,6 +63,20 @@ class _FakeService:
                                "suggested_ppc": 950.0},
                 "market": {}, "explanation": "test"}
 
+    # Mirrors the REAL PricingService.price_many contract: one entry per stone,
+    # in order, and a stone that fails comes back AS an Exception rather than
+    # raising — that is what lets one bad stone cost only its own row.
+    # `test_price_many_returns_failures_it_does_not_raise_them` pins the real
+    # service to this same shape so the double cannot quietly drift from it.
+    def price_many(self, stones, *, explain=True):
+        out = []
+        for s in stones:
+            try:
+                out.append(self.price(s))
+            except Exception as e:      # noqa: BLE001 - contract is to return it
+                out.append(e)
+        return out
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
@@ -248,3 +262,69 @@ def test_a_batch_survives_a_stone_it_cannot_price(monkeypatch):
     rows = {x["StoneId"]: x for x in r.json()}
     assert rows["FANCY"]["AIDiscount"] is None and rows["FANCY"]["Error"]
     assert rows["WHITE"]["AIDiscount"] is not None, "a good stone must still price"
+
+
+# --- /health must describe what is SERVING, not what is on disk -------------
+# The model is loaded once per uvicorn worker and there is no reload path, so a
+# nightly promotion does not reach a running worker — only a restart does.
+# /health called registry.load_current() and reported the promoted version as
+# though it were live, so a worker could serve a months-old model behind a green
+# health check. CLAUDE.md Trap 5: never describe a pipeline the client is not
+# being served by. (Trap 9's rule too: /health is not evidence pricing is right.)
+
+class _Loaded:
+    def __init__(self, version): self.model_version = version
+
+
+def test_health_flags_a_worker_serving_a_stale_model(client, monkeypatch):
+    from glowstar.service import app as A
+    from glowstar.models import registry
+    monkeypatch.setattr(registry, "load_current",
+                        lambda: (object(), {"version": "20260825T000000",
+                                            "trained_at": "2026-08-25T00:00:00"}))
+    monkeypatch.setattr(A, "_service", _Loaded("20260701T000000"))
+
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    joined = " ".join(body.get("warnings", []))
+    assert "20260701T000000" in joined and "20260825T000000" in joined, \
+        "the alarm must name BOTH versions or an operator cannot act on it"
+    assert "restart" in joined.lower(), "the warning must say what to do"
+    assert body["model"]["serving_version"] == "20260701T000000"
+    assert body["model"]["version"] == "20260825T000000"
+
+
+def test_health_is_quiet_when_the_worker_is_up_to_date(client, monkeypatch):
+    from glowstar.service import app as A
+    from glowstar.models import registry
+    import datetime as dt
+    now = dt.datetime.now().isoformat()
+    monkeypatch.setattr(registry, "load_current",
+                        lambda: (object(), {"version": "V1", "trained_at": now}))
+    monkeypatch.setattr(A, "_service", _Loaded("V1"))
+
+    body = client.get("/health").json()
+    joined = " ".join(body.get("warnings", []))
+    assert "is promoted" not in joined, \
+        f"false alarm on a worker that IS current: {joined}"
+    assert body["model"]["serving_version"] == "V1"
+
+
+def test_health_reports_every_problem_not_just_the_last_one(client, monkeypatch):
+    """Each check used to assign out['warning'] directly, so two simultaneous
+    faults reported only whichever ran last — the operator fixes what they can
+    see and the other stays hidden."""
+    from glowstar.service import app as A
+    from glowstar.models import registry
+    monkeypatch.setattr(registry, "load_current",
+                        lambda: (object(), {"version": "NEW",
+                                            "trained_at": "2026-01-01T00:00:00"}))
+    monkeypatch.setattr(A, "_service", _Loaded("OLD"))
+    monkeypatch.setattr(A, "_grid_age_days", lambda: 99)
+
+    body = client.get("/health").json()
+    warns = body.get("warnings", [])
+    assert len(warns) >= 3, f"expected stale-model + stale-grid + old-model, got {warns}"
+    joined = " ".join(warns)
+    assert "is promoted" in joined and "grid" in joined and "days old" in joined
+    assert body["warning"] == "; ".join(warns), "the legacy string key must still work"

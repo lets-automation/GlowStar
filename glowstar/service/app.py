@@ -179,11 +179,42 @@ if FastAPI is not None:
         import datetime as _dt
 
         out: dict = {"status": "ok"}
+        # EVERY problem, not just the last one found. Each check used to assign
+        # out["warning"] directly, so a stale grid AND an old model reported only
+        # whichever check ran last — an operator fixes the one they can see and
+        # the other stays hidden. Accumulate, then publish all of them.
+        warns: list[str] = []
+
+        def _warn(msg: str) -> None:
+            out["status"] = "degraded"
+            warns.append(msg)
+
         try:
             _, card = registry.load_current()
-            out["model"] = {"version": (card or {}).get("version"),
+            registry_version = (card or {}).get("version")
+            out["model"] = {"version": registry_version,
                             "trained_at": (card or {}).get("trained_at"),
                             "test_mae": (card or {}).get("test_mae")}
+            # WHAT THIS WORKER IS ACTUALLY SERVING.
+            #
+            # The model is loaded once per uvicorn worker and there is no reload
+            # path, so a nightly promotion does NOT reach a running worker — only
+            # a restart does. This endpoint read the REGISTRY and reported the
+            # freshly promoted version as though it were live, which is the exact
+            # failure CLAUDE.md Trap 5 describes: a health surface describing a
+            # pipeline the client is not being served by. Every accuracy gain the
+            # gate reported could sit on disk indefinitely, unseen, while /health
+            # stayed green.
+            #
+            # `serving_version` is read off the loaded service, so the two can
+            # disagree — and when they do, that IS the alarm.
+            serving = getattr(_service, "model_version", None)
+            out["model"]["serving_version"] = serving
+            if _service is None:
+                out["model"]["serving_version"] = "not-loaded"
+            elif serving and registry_version and serving != registry_version:
+                _warn(f"worker is serving model {serving} but {registry_version} "
+                      "is promoted — restart glowstar-api to pick it up")
         except Exception as e:
             out["status"] = "degraded"
             out["model"] = {"error": type(e).__name__}
@@ -191,8 +222,7 @@ if FastAPI is not None:
             age_h = (_dt.datetime.now().timestamp() - PATHS.records.stat().st_mtime) / 3600
             out["records_age_hours"] = round(age_h, 1)
             if age_h > 48:
-                out["status"] = "degraded"
-                out["warning"] = "inventory data is more than 48h old"
+                _warn("inventory data is more than 48h old")
         except OSError:
             out["status"] = "degraded"
             out["records_age_hours"] = None
@@ -209,12 +239,10 @@ if FastAPI is not None:
             age_d = _grid_age_days()
             out["grid_age_days"] = age_d
             if age_d is None:
-                out["status"] = "degraded"
-                out["warning"] = "no grid history on disk"
+                _warn("no grid history on disk")
             elif age_d > 3:
-                out["status"] = "degraded"
-                out["warning"] = (f"price grid is {age_d} days stale — the nightly "
-                                  f"job may have stopped")
+                _warn(f"price grid is {age_d} days stale — the nightly job "
+                      "may have stopped")
         except Exception:
             out["status"] = "degraded"
             out["grid_age_days"] = None
@@ -228,9 +256,8 @@ if FastAPI is not None:
                 days = (_dt.datetime.now() - _dt.datetime.fromisoformat(trained)).days
                 out["model"]["age_days"] = days
                 if days > 2:
-                    out["status"] = "degraded"
-                    out["warning"] = (f"model is {days} days old — the nightly "
-                                      f"retrain has not promoted since then")
+                    _warn(f"model is {days} days old — the nightly retrain "
+                          "has not promoted since then")
         except Exception:
             pass
 
@@ -244,6 +271,10 @@ if FastAPI is not None:
         except Exception as e:
             out["status"] = "degraded"
             out["store"] = {"error": type(e).__name__}
+
+        if warns:
+            out["warnings"] = warns
+            out["warning"] = "; ".join(warns)   # kept: existing consumers read this
         return out
 
     def _audit(res: dict, stone: StoneIn, source: str) -> dict:
@@ -311,14 +342,19 @@ if FastAPI is not None:
         """
         if len(stones) > 5000:
             raise HTTPException(status_code=413, detail="max 5000 stones per call")
+        # ONE model call for the whole book — see PricingService.price_many.
+        # The per-stone loop ran ~95 ms/stone, so the documented 5,000-stone limit
+        # took ~8 minutes against nginx's 300 s timeout: the advertised maximum
+        # request exceeded the advertised timeout. Batched it is ~2.3 ms/stone.
         svc = _get_service()
         priced, failed = [], []
-        for s in stones:
-            try:
-                priced.append(_audit(svc.price(s), s, "api-batch"))
-            except Exception as e:
-                log.exception("pricing failed for %s", s.StoneId)
-                failed.append({"stone_id": s.StoneId, "error": f"{type(e).__name__}: {e}"})
+        for s, res in zip(stones, svc.price_many(stones)):
+            if isinstance(res, Exception):
+                log.exception("pricing failed for %s: %s", s.StoneId, res)
+                failed.append({"stone_id": s.StoneId,
+                               "error": f"{type(res).__name__}: {res}"})
+            else:
+                priced.append(_audit(res, s, "api-batch"))
         return {"priced": priced, "failed": failed,
                 "n_priced": len(priced), "n_failed": len(failed)}
 

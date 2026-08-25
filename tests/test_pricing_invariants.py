@@ -802,3 +802,57 @@ def test_correction_returns_nothing_when_disabled_and_can_be_re_enabled():
     # re-enabled it reaches the real guard (no gbm yet) rather than the switch
     assert eng._fit_bias_correction(pd.DataFrame()) == {}
     assert hasattr(eng, "_fit_bias_correction"), "the mechanism must not be deleted"
+
+
+# --- price_many is a CONTRACT, not just an optimisation ---------------------
+# The batch endpoints depend on two guarantees, and the test doubles in
+# test_api.py / test_frontoffice.py reimplement them. If the real service ever
+# drifts from this shape the doubles would keep those tests green while
+# production broke, so pin the real thing here.
+
+def _stone(i: int, **kw):
+    from glowstar.service.pricing_service import StoneIn
+    base = dict(StoneId=f"PM-{i}", Shape_full="RBC", Weight=0.90, Color="G",
+                Clarity="VS1", CPS="3EX", Fluorescence="NON")
+    base.update(kw)
+    return StoneIn(**base)
+
+
+def test_price_many_returns_failures_it_does_not_raise_them():
+    """One unpriceable stone must cost its own row and nothing else."""
+    from glowstar.service.pricing_service import PricingService
+    svc = PricingService()
+    stones = [_stone(0), _stone(1, Color="Fancy Vivid Yellow"), _stone(2)]
+
+    out = svc.price_many(stones)          # must not raise
+
+    assert len(out) == len(stones), "one entry per stone, in order"
+    assert isinstance(out[1], Exception), "the fancy stone must come back AS an error"
+    for i in (0, 2):
+        assert isinstance(out[i], dict) and "suggestion" in out[i], \
+            "a good stone must still be priced when a neighbour fails"
+    assert out[0]["suggestion"]["stone_id"] == "PM-0"
+    assert out[2]["suggestion"]["stone_id"] == "PM-2", "results must not be re-ordered"
+
+
+def test_price_many_agrees_with_price_stone_for_stone():
+    """Trap 9's rule: the same stone through the old and the new path must agree."""
+    from glowstar.service.pricing_service import PricingService
+    svc = PricingService()
+    stones = [_stone(i, Weight=round(0.30 + 0.07 * i, 2),
+                     Color=c, Clarity=cl, Shape_full=sh)
+              for i, (c, cl, sh) in enumerate(
+                  [("D", "IF", "RBC"), ("G", "VS1", "PB"), ("J", "SI2", "OB"),
+                   ("H", "VVS2", "RBC"), ("M", "I1", "MB")])]
+
+    batched = svc.price_many(stones)
+    for st, b in zip(stones, batched):
+        single = svc.price(st)
+        assert round(b["suggestion"]["suggested_discount"], 6) == \
+               round(single["suggestion"]["suggested_discount"], 6), \
+            f"{st.StoneId}: batch and single-stone paths disagree"
+
+
+def test_price_many_on_an_empty_book_is_not_an_error():
+    from glowstar.service.pricing_service import PricingService
+    assert PricingService().price_many([]) == []
