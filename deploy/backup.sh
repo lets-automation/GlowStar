@@ -24,11 +24,36 @@ gzip -c /opt/glowstar/data/master_grid/history.json \
 #     FATAL: database "postgresql+psycopg://..." does not exist
 # so the nightly dump would fail EVERY night while the grid backup beside it
 # succeeded. Strip the driver suffix to get a URL libpq understands.
-if [[ "${GS_DATABASE_URL:-}" == postgres* ]]; then
+# NEVER FALL BACK SILENTLY. This used to drop to a sqlite branch whenever
+# GS_DATABASE_URL was unset. systemd sets it from EnvironmentFile, so the
+# NIGHTLY run was fine — but a human running `bash deploy/backup.sh` from a root
+# shell has no such variable, took the sqlite branch, and sqlite3 CREATED an
+# empty database and "backed up" 4096 bytes of nothing. It then sat in the
+# listing beside the real 536 KB dumps looking like a backup, on a day the
+# nightly had already failed. A backup you believe in but do not have is worse
+# than no backup, so an unset URL is now a hard error.
+if [[ -z "${GS_DATABASE_URL:-}" ]]; then
+  echo "ERROR: GS_DATABASE_URL is not set - refusing to write a fake backup." >&2
+  echo "       systemd supplies it via EnvironmentFile. To run this by hand:" >&2
+  echo "         sudo -u glowstar bash -c 'set -a; . /opt/glowstar/.env; set +a; bash /opt/glowstar/deploy/backup.sh'" >&2
+  exit 1
+fi
+
+if [[ "${GS_DATABASE_URL}" == postgres* ]]; then
   PG_URL="$(printf '%s' "$GS_DATABASE_URL" | sed -E 's#^(postgresql|postgres)\+[a-z0-9_]+://#\1://#')"
   pg_dump "$PG_URL" | gzip > "$BACKUP_DIR/db_$STAMP.sql.gz"
+  DB_FILE="$BACKUP_DIR/db_$STAMP.sql.gz"
 else
-  sqlite3 /opt/glowstar/data/glowstar.db ".backup '$BACKUP_DIR/db_$STAMP.db'"
+  sqlite3 "${GS_DATABASE_URL#sqlite:///}" ".backup '$BACKUP_DIR/db_$STAMP.db'"
+  DB_FILE="$BACKUP_DIR/db_$STAMP.db"
+fi
+
+# A dump can also fail UPWARD into an empty-but-present file (bad credentials, a
+# killed pg_dump). Assert a plausible size rather than trusting exit status 0.
+DB_BYTES=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+if (( DB_BYTES < 20000 )); then
+  echo "ERROR: $DB_FILE is only $DB_BYTES bytes - that is not a real dump." >&2
+  exit 1
 fi
 
 # 3. feedback JSONL (small, and the training pipeline still reads it)

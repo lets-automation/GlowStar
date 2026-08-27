@@ -326,8 +326,16 @@ def retrain(*, prefer_live: bool = True, split_date: str | None = None,
     except Exception:
         log.exception("Registry prune failed (non-fatal; the new model is saved).")
 
+    # `len(test)`, not `info.n_test`. `info` never existed — it was left behind
+    # when the gate moved to the rolling production horizon and `gate_split` began
+    # returning (train, test, origin). It raised NameError AFTER the model was
+    # saved and promoted, so every symptom pointed the wrong way: the log said
+    # "Saved model ... promoted=True" and the model really was in the registry,
+    # while the unit exited non-zero and systemd silently skipped everything
+    # after it — the drift report, the nightly BACKUP, and the ExecStartPost that
+    # restarts the API onto the model it had just promoted.
     summary = {"version": version, "promoted": promote, "reason": reason,
-               "metrics": metrics, "n_sold": len(sold), "n_test": info.n_test,
+               "metrics": metrics, "n_sold": len(sold), "n_test": len(test),
                "n_feedback": len(feedback)}
     log.info("Retrain %s: promoted=%s (%s); metrics=%s", version, promote, reason, metrics)
     return summary
