@@ -812,10 +812,31 @@ class PricingEngine:
             # Competence guard: a shape the model loses to the segment median on
             # (measured out-of-time at fit time) is priced by the baseline and
             # flagged for human review rather than auto-priced by the model.
-            if row["Shape_full"] in defer_shapes:
+            #
+            # A GRID CELL OVERRIDES THE DEFERRAL. The guard judges a SHAPE on an
+            # inner 60-day slice; the fallback it defers to is the hierarchical
+            # median, which is shape/size/colour/clarity only and cannot see the
+            # grid at all. So a stone carrying the desk's own current price for its
+            # exact cell was having that thrown away in favour of a shape-blind
+            # median. Measured on the rolling 7-day horizon, the stones this guard
+            # deferred (70 Pear in one week, 7 Sq.Emerald in another — every one of
+            # them WITH a cell):
+            #     deferred to the baseline   MAE 3.77   bias +2.30   33.8% >=5pt
+            #     their grid cell alone      MAE 1.81
+            #     the same shapes when not deferred: Pear 1.99, Sq.Emerald 1.95
+            # Deferring a shape with 1,765 training rows off one inner slice is
+            # noise, not a competence gap — and it is CLAUDE.md Trap 5's third head
+            # (a guard benching stones against something worse than the model).
+            #
+            # The flag STILL fires, so the desk is told to look. Only the routing
+            # changes, and only when there is a real cell to route on.
+            deferred = row["Shape_full"] in defer_shapes
+            if deferred:
                 route_flags = route_flags + ["segment_review"]
+            has_cell = ("grid_discount" in row.index
+                        and pd.notna(row.get("grid_discount")))
             use_fallback = (("fancy_color" in route_flags) or ("rare_shape" in route_flags)
-                            or (row["Shape_full"] in defer_shapes))
+                            or (deferred and not has_cell))
 
             # BGM-as-base: clean-base prediction, then explicit BGM deduction.
             bgm = bgm_assess(row.to_dict(), self.tables)

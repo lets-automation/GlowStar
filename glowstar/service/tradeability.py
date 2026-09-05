@@ -119,6 +119,31 @@ def _km_median(durations: np.ndarray, observed: np.ndarray) -> float:
     return float("inf")             # median not reached — the segment is genuinely slow
 
 
+def _observation_asof(df: pd.DataFrame) -> pd.Timestamp | None:
+    """The date the STOCK arm was last observed unsold, recovered from the data.
+
+    Uses the client's own verified identity `Ageing == asof - MarketSheetDate` on
+    Stock rows and takes the MODE, so one malformed row cannot move it. Returns
+    None when there is no stock to date the snapshot from; the caller then falls
+    back to today, which is the old behaviour.
+
+    Deliberately a local copy of `inventory.survival.observation_asof` rather than
+    an import: that package is a separate workstream and is not deployed to the
+    pricing server. Two small identical functions beat a cross-workstream import
+    that breaks serving.
+    """
+    stock = df[df["Status"] == "Stock"]
+    if not len(stock):
+        return None
+    implied = (stock["MarketSheetDate_dt"]
+               + pd.to_timedelta(pd.to_numeric(stock["Ageing"], errors="coerce"),
+                                 unit="D"))
+    implied = implied.dropna()
+    if not len(implied):
+        return None
+    return pd.Timestamp(implied.dt.normalize().mode().iloc[0])
+
+
 def _segment(shape, color, clarity) -> str:
     return f"{str(shape).strip().title()}|{str(color).strip().upper()}|{str(clarity).strip().upper()}"
 
@@ -138,13 +163,30 @@ def build_table(force: bool = False) -> _Table:
             if c not in df.columns:
                 df[c] = pd.to_datetime(df[c.replace("_dt", "")], errors="coerce",
                                        utc=True).dt.tz_localize(None)
-        now = pd.Timestamp.now().normalize()
+        # CENSOR AT THE DATE WE LAST OBSERVED THE BOOK, NOT AT THE WALL CLOCK.
+        #
+        # A stock stone is censored at the moment we last SAW it unsold — the
+        # snapshot behind `records.json` — not at `today`. If the nightly pull is
+        # late, censoring at `today` silently adds that many phantom "still
+        # unsold" days to every stone in the book and reports the desk as SLOWER
+        # than they are. On a 5-day-stale file the effect is not 5 days: a
+        # Kaplan-Meier median lands on a step, so segments moved by up to 54 days.
+        #
+        # `inventory/survival.py` already does this correctly, and the two are
+        # held together by test_survival::test_agrees_with_the_shipped_tradeability_table.
+        # That test was failing purely on this difference — with the same clock the
+        # two estimators agree on 236/236 segments to 0.0 days.
+        #
+        # Derived here rather than imported from `glowstar.inventory`, because the
+        # inventory package is a separate workstream and is NOT deployed to the
+        # pricing server — importing it would take this module down there.
+        now = _observation_asof(df) or pd.Timestamp.now().normalize()
 
         sold = df[df["Status"] == "Sold"].copy()
         sold["dur"] = (sold["OrderDate_dt"] - sold["MarketSheetDate_dt"]).dt.days
         sold["obs"] = True
 
-        # CENSORED: still in stock. Duration so far = today - listed.
+        # CENSORED: still in stock. Duration so far = last observed - listed.
         stock = df[df["Status"] == "Stock"].copy()
         stock["dur"] = (now - stock["MarketSheetDate_dt"]).dt.days
         stock["obs"] = False

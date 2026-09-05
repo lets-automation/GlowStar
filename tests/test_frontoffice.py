@@ -381,3 +381,70 @@ def test_resolution_still_returns_none_for_a_stone_we_never_priced():
     """External goods are legitimate — we must not invent attributes."""
     from glowstar.service.frontoffice import resolve_stone
     assert resolve_stone("never-quoted-cert-123", "never-quoted-id-123") is None
+
+
+# --- a cape stone must cost its own row, in language the desk can act on ------
+# MEASURED IN PRODUCTION 2026-09-03. The desk sent 33 stones; 31 priced; 2 were
+# cape colours (OI26-53 O-P, TU-35 U-V). We answered 200 with two error rows and
+# their CRM blanked the ENTIRE grid and showed "[object Object]". They retried
+# three times, same two rows each time.
+#
+# We cannot fix their handler. We CAN stop shipping a stringified Python
+# exception to a pricing desk: the row used to carry
+#   "ValueError: No Rapaport price for 0.82ct O-P/VVS1 Round
+#    (fancy_or_cape_color): ... Route to attribute-based fallback."
+# — an exception class name plus an internal routing instruction.
+
+def _real_client(monkeypatch):
+    from fastapi.testclient import TestClient
+    from glowstar.service import app as app_mod
+    monkeypatch.delenv("GS_API_KEY", raising=False)
+    return TestClient(app_mod.app)
+
+
+def test_cape_stone_does_not_cost_the_rest_of_the_book(monkeypatch):
+    c = _real_client(monkeypatch)
+    body = [
+        {"stoneId": "OK-1", "shape": "RBC", "weight": 0.8, "color": "D",
+         "clarity": "VS1", "cut": "EX", "polish": "EX", "symmetry": "EX",
+         "fluorescence": "NON"},
+        {"stoneId": "OI26-53", "shape": "RBC", "weight": 0.82, "color": "O-P",
+         "clarity": "VVS1", "cut": "EX", "polish": "EX", "symmetry": "EX",
+         "fluorescence": "NON"},
+    ]
+    r = c.post("/frontoffice/price", json=body)
+    assert r.status_code == 200, "one cape stone must never fail the book"
+    rows = {x["StoneId"]: x for x in r.json()}
+    assert len(rows) == 2, "one row per stone, always"
+    assert rows["OK-1"]["AIDiscount"] is not None, \
+        "the priceable stone must still be priced"
+
+    bad = rows["OI26-53"]
+    assert bad["AIDiscount"] is None
+    assert bad["NeedsReview"] is True
+    for field in ("Reason", "Error"):
+        txt = bad[field]
+        assert txt, f"{field} must not be empty - the desk sees a blank cell"
+        assert "O-P" in txt, f"{field} must name what is wrong with THIS stone"
+        assert "manual" in txt.lower(), f"{field} must say what to DO"
+        # never ship internals to a pricing clerk
+        assert "ValueError" not in txt and "Error:" not in txt, \
+            f"{field} leaks an exception class name: {txt!r}"
+        assert "fallback" not in txt.lower(), \
+            f"{field} leaks an internal routing instruction: {txt!r}"
+        assert "Traceback" not in txt
+
+
+def test_reason_is_populated_for_every_row_priced_or_not(monkeypatch):
+    """A blank Reason is what made the desk's grid look broken."""
+    c = _real_client(monkeypatch)
+    body = [
+        {"stoneId": "A", "shape": "RBC", "weight": 0.9, "color": "G",
+         "clarity": "VS1", "cut": "EX", "polish": "EX", "symmetry": "EX",
+         "fluorescence": "NON"},
+        {"stoneId": "B", "shape": "RBC", "weight": 0.8, "color": "U-V",
+         "clarity": "SI2", "cut": "VG", "polish": "EX", "symmetry": "EX",
+         "fluorescence": "NON"},
+    ]
+    for row in c.post("/frontoffice/price", json=body).json():
+        assert row.get("Reason"), f"{row['StoneId']} came back with no Reason"

@@ -122,7 +122,11 @@ _SHAPE_FULL: dict[str, str] = {
     "HEART": "Heart", "HB": "Heart", "HS": "Heart",
     "EMERALD": "Emerald", "EM": "Emerald", "EB": "Emerald", "EC": "Emerald",
     "PRINCESS": "Princess", "PR": "Princess", "SMB": "Princess",
-    "CUSHION": "Cushion", "CB": "Cushion", "CU": "Cushion", "CMB": "Cushion",
+    # NOTE: `CB` and `CMB` are NOT here — see the client-code block below. They
+    # used to map to "Cushion", but the client's own feed pairs CB with "Cushion
+    # Brilliant" and CMB with "Cushion". Defining them twice in one literal would
+    # let a reorder flip the meaning silently, so they live in exactly one place.
+    "CUSHION": "Cushion", "CU": "Cushion",
     # RADIANT -> "Cut-Cornered Rectangular", NOT "Radiant".
     # "Radiant" has ZERO training rows; the name the client's inventory uses, and
     # therefore the name the model learned, is "Cut-Cornered Rectangular" (183
@@ -141,6 +145,36 @@ _SHAPE_FULL: dict[str, str] = {
     "SQ. EMERALD": "Sq. Emerald", "SQ.EMERALD": "Sq. Emerald",
     "SQ EMERALD": "Sq. Emerald", "SQEM": "Sq. Emerald", "SEM": "Sq. Emerald",
     "SE": "Sq. Emerald",
+    # ------------------------------------------------------------------
+    # THE CLIENT'S OWN MODIFIER CODES. Read off their feed, not guessed: their
+    # records carry BOTH a `Shape` code and a `Shape_full` name, and the pairing
+    # is 1:1 (verified — no code maps to two names across 42,227 records).
+    #
+    # These were missing, and the CRM really does send them: the served-quote
+    # audit trail contains `CL` and `PEAR MODIFIED`. An unmapped code is returned
+    # unchanged, matches no trained level, and is flagged `rare_shape` — so the
+    # stone drops to the median fallback instead of being priced by the model.
+    # Every one of them is a FANCY shape, which is why this showed up as "fancy
+    # is very bad" rather than as a general fault.
+    #
+    # Four of these reach a level the model actually knows (214 stones in the
+    # book): CL, DUTCH MARQUISE, HEART MODIFIED, PEAR MODIFIED.
+    "CL": "Cushion Long",                 # 162 stones — Cushion Long has 51 sold rows
+    "DUTCH MARQUISE": "Marquise",         #  31
+    "HEART MODIFIED": "Heart",            #  16
+    "PEAR MODIFIED": "Pear",              #   5
+    # These reach a name the model has SEEN but has too little history for, so
+    # they stay `rare_shape` either way. Mapped anyway so the NAME is right
+    # everywhere — the grid lookup, the reports and the audit trail all key on it.
+    "CB": "Cushion Brilliant", "CMB": "Cushion",
+    "OLD MINE": "Old Miner", "RS": "Rosecut", "BUG": "Bug",
+    # DELIBERATELY NOT MAPPED: KITE, TRILLIANT, HEXAGONAL, HEXAGONAL LONG.
+    # Their target names have ZERO sold rows, so emitting them would put a value
+    # into `Shape_full` that the model has never seen — which HistGradientBoosting
+    # drops silently, the exact failure `test_no_normaliser_can_emit_a_value_the_
+    # model_never_saw` exists to prevent. Passing the code through unchanged is
+    # both honest and identical in outcome: `rare_shape`, priced by the fallback.
+    # Map them only once the client has sold enough of them to train on.
 }
 
 

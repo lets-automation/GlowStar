@@ -142,6 +142,34 @@ def main() -> None:
     except Exception as e:
         print(f"feedback readiness: unavailable ({type(e).__name__})")
 
+    # --- Workstream B: the velocity model behind tradeability & bifurcation ---
+    # Same rule as everything else in this file: the numbers are read from the
+    # registry NOW, never quoted from a document. A velocity model that silently
+    # stops being promoted is exactly as damaging as a pricing model that does,
+    # and it is less likely to be noticed because no invoice depends on it.
+    try:
+        from .training import velocity_retrain as _VR
+        _model, _card = _VR.load_current()
+        if _card is None:
+            print("velocity     : none promoted yet "
+                  "(python -m glowstar.training.velocity_retrain)")
+        else:
+            print(f"velocity     : {_card['version']}   trained {_card['trained_at']}")
+            print(f"  out-of-time : C-index={_card['c_index']} "
+                  f"(segment-median baseline {_card['c_index_baseline']})  "
+                  f"calibration err={_card['calibration_error']}")
+            print(f"  trained on  : {_card['n_train']:,} listings / "
+                  f"{_card['n_train_events']:,} sales; "
+                  f"tested on {_card['n_test']:,} / {_card['n_test_events']:,}")
+            print(f"  promoted    : {_card['promoted']}  ({_card['notes']})")
+            if _card.get("dropped_features"):
+                print(f"  DROPPED     : {list(_card['dropped_features'])} — a feed "
+                      f"behind these is not arriving")
+            best = _VR.best_c_index()
+            print(f"  best ever   : {best}   protocol {_card.get('metric_protocol')}")
+    except Exception as e:
+        print(f"velocity     : unavailable ({type(e).__name__}: {e})")
+
     # --- config that changes pricing ---
     print(f"backtest split: {SETTINGS.backtest_split_date}")
     # Read the sheet's OWN date. This line used to hardcode "April CSV" and stayed

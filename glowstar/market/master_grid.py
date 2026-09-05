@@ -162,10 +162,19 @@ class MasterGrid:
         if not cells:
             return None
         w = float(weight)
+        # NARROWEST containing bracket wins (ties: lower `lo`). The grid publishes
+        # overlapping brackets for one cell (narrow Master slots under coarse
+        # 0.x0-0.x9 overlays and foreign-sheet cells); the first-match rule printed
+        # the overlay as "Your Master grid" for ~12% of Round stones, ~17 pts from
+        # where they sold. Must stay identical to GridHistory._read_key so the
+        # client column and the model feature never disagree.
+        best = None                              # (width, lo, cell)
         for lo, hi, c in cells:
             if lo <= w <= hi:
-                return self._to_cell(c, today)
-        return None
+                cand = (hi - lo, lo, c)
+                if best is None or cand[:2] < best[:2]:
+                    best = cand
+        return self._to_cell(best[2], today) if best is not None else None
 
     @staticmethod
     def _to_cell(c: dict, today: date | None) -> GridCell:

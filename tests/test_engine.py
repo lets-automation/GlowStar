@@ -66,18 +66,52 @@ def test_engine_beats_baseline_threshold(trained):
 
 def test_competence_guard_defers_weak_shapes(trained):
     """A shape the model+anchor loses to the segment median on (measured out-of-time)
-    must route to the baseline and carry a human-review flag, not be auto-priced.
-    On this data Sq.Emerald is the clear structural loser (model MAE ~8 vs median
-    ~2); it must be deferred, and any deferred shape must use the fallback path."""
+    must be FLAGGED for human review, and must route to the baseline WHEN THERE IS
+    NOTHING BETTER TO ROUTE TO.
+
+    A GRID CELL IS SOMETHING BETTER, and that is a change from the original rule
+    ("any deferred shape must use the fallback path"). The fallback is the
+    hierarchical median over shape/size/colour/clarity — it cannot see the grid at
+    all — so a deferred stone carrying the desk's own current price for its exact
+    cell was having that thrown away.
+
+    Measured out-of-time on the rolling 7-day production horizon, on the 168 stones
+    the guard deferred that DID have a cell:
+
+        deferred to the median baseline   MAE 4.53
+        model-priced instead              MAE 2.08     (improved on 130/168)
+          Oval  5.17 -> 2.60      Pear  3.63 -> 1.35
+
+    Round, which is never deferred, moved 1.4931 -> 1.4946 across the same runs, so
+    that is not refit noise. The guard's judgement is made per SHAPE on a 60-day
+    inner slice; it should not override the strongest per-STONE signal available.
+    """
     eng, test = trained
     # The guard fired (data-driven, not hardcoded) and picked the known weak shape.
     assert "Sq. Emerald" in eng._defer_shapes
-    weak = test[test["Shape_full"].isin(eng._defer_shapes)]
-    if len(weak):
-        sugg = eng.predict(weak.head(20))
-        assert all(s.method == "fallback" and "segment_review" in s.flags for s in sugg)
     # Shapes the model wins on must NOT be deferred (no over-routing to the median).
     assert "Round" not in eng._defer_shapes
+
+    weak = test[test["Shape_full"].isin(eng._defer_shapes)]
+    if not len(weak):
+        return
+    from glowstar.market.grid_history import attach_grid
+    weak = attach_grid(weak.head(40), eng.grid_history)
+    sugg = eng.predict(weak)
+
+    # The review flag fires for EVERY deferred stone, cell or no cell — the desk is
+    # always told to look. Only the routing depends on the cell.
+    assert all("segment_review" in s.flags for s in sugg)
+
+    has_cell = weak["grid_discount"].notna().tolist()
+    for s, cell in zip(sugg, has_cell):
+        if cell:
+            assert s.method != "fallback", (
+                "a deferred stone WITH a grid cell must be model-priced; the "
+                "fallback cannot see the grid")
+        else:
+            assert s.method == "fallback", (
+                "a deferred stone with NO cell has nothing better than the median")
 
 
 def test_bgm_assessed_from_inventory(trained):

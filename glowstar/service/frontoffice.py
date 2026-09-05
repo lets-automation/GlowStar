@@ -244,6 +244,29 @@ _NOT_YET_LEARNABLE = (
 )
 
 
+def _desk_reason(exc: Exception, fo: "FrontOfficeStone") -> str:
+    """Turn a pricing failure into a sentence a pricing clerk can act on.
+
+    The desk sees this string in their grid. It must say what is wrong with THIS
+    stone and what to do about it — never an exception class name, never an
+    internal routing instruction like "route to attribute-based fallback", which
+    reads to a clerk as though the system is broken.
+    """
+    msg = str(exc)
+    if "not a white D-N grade" in msg or "fancy_or_cape_color" in msg:
+        return (f"{fo.color} is a cape/fancy colour. The Rapaport list covers "
+                f"white D-N only, so this stone has no Rap cell and there is no "
+                f"discount to quote against - price it manually.")
+    if "No Rapaport price" in msg:
+        detail = msg.split("(")[-1].split(")")[0] if "(" in msg else "no Rap cell"
+        return (f"No Rapaport cell for {fo.weight}ct {fo.color}/{fo.clarity} "
+                f"{fo.shape} ({detail}) - price it manually.")
+    if isinstance(exc, (ValueError, TypeError)) and "validation" in msg.lower():
+        return f"This stone's details could not be read: {msg.splitlines()[0]}"
+    return ("This stone could not be priced automatically - please price it "
+            "manually and tell us the stone id so we can look into it.")
+
+
 def to_stone_in(fo: FrontOfficeStone):
     """FrontOffice stone -> the engine's StoneIn.
 
@@ -370,16 +393,41 @@ def price_stones(stones: list[FrontOfficeStone], service) -> list[dict]:
             })
             # Durable audit + the evidence needed to refit the score weights.
             # Best-effort by design: a store outage must never cost a price.
-            _persist(fo, f, scores, trade, service)
+            #
+            # `stone`, NOT `fo`. FrontOfficeStone carries the RAW trade code the
+            # CRM sent (`shape="RBC"`), while `stone` is the canonicalised StoneIn
+            # the price was actually computed from (`Shape_full="Round"`).
+            # record_quote reads `Shape_full` first and falls back to `shape`, so
+            # passing `fo` wrote the un-normalised code: measured on the served
+            # book, 3,198 of 3,954 quotes were stored as "RBC" and only 507 as
+            # "Round". Nothing was mispriced — but the audit trail is what answers
+            # "what did we quote for this shape", and grouped by it every fancy
+            # figure was wrong, because RBC (a ROUND) does not match "Round".
+            _persist(fo, f, scores, trade, service, stone=stone)
             unused = _unused_fields(fo)
             if unused:
                 row["ReceivedNotYetPriced"] = unused
         except Exception as e:                      # one bad stone never fails a book
             log.exception("FrontOffice pricing failed for %s", fo.stoneId)
-            row.update({"AIDiscount": None, "Reason": None, "Tradeability": None,
+            # A ROW THE DESK CAN READ, NOT A PYTHON TRACEBACK.
+            #
+            # This used to emit `Error: "ValueError: No Rapaport price for 0.82ct
+            # O-P/VVS1 Round (fancy_or_cape_color): ... Route to attribute-based
+            # fallback."` — an exception class name and an internal routing
+            # instruction, shipped to a pricing desk.
+            #
+            # MEASURED 2026-09-03: the desk sent 33 stones, 31 priced, 2 were cape
+            # colours (O-P, U-V). We answered 200 with two such rows and their CRM
+            # blanked the ENTIRE grid, showing "[object Object]". They retried three
+            # times and got the same two rows each time. We cannot fix their
+            # handler, but we can stop handing it a stringified exception — and we
+            # can fill `Reason`, which their screen already renders, so the desk
+            # sees WHY instead of an empty cell.
+            reason = _desk_reason(e, fo)
+            row.update({"AIDiscount": None, "Reason": reason, "Tradeability": None,
                         "ConfidenceScore": 0, "AIScore": None, "FinalAIScore": None,
                         "NeedsReview": True,
-                        "Error": f"{type(e).__name__}: {e}"})
+                        "Error": reason})
         out.append(row)
     return out
 
@@ -407,12 +455,22 @@ def model_version(service) -> str | None:
     return v
 
 
-def _persist(fo, facts: dict, scores: dict, trade: dict, service) -> None:
-    """Record the quote and its scores. Never raises — see store/db.py."""
+def _persist(fo, facts: dict, scores: dict, trade: dict, service, stone=None) -> None:
+    """Record the quote and its scores. Never raises — see store/db.py.
+
+    `stone` is the CANONICALISED StoneIn the price was computed from. It is what
+    the audit row is keyed on; `fo` supplies only the identifiers the CRM sent
+    (stoneId / certificateNo), which StoneIn does not carry in full.
+    """
     try:
         from ..store import db
         mv = model_version(service)
-        db.record_quote(facts=facts, stone=fo.model_dump(), model_version=mv,
+        payload = dict(fo.model_dump())
+        if stone is not None:
+            # Canonical attributes win; the raw code is kept under `shape` only as
+            # a fallback for callers that never built a StoneIn.
+            payload.update(stone.model_dump())
+        db.record_quote(facts=facts, stone=payload, model_version=mv,
                         source="frontoffice")
         db.record_scores(stone_id=fo.stoneId, s=scores, tradeability=trade,
                          model_version=mv)

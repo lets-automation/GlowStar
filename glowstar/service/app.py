@@ -117,6 +117,17 @@ if FastAPI is not None:
                 "GS_ENV=production but GS_API_KEY is not set — refusing to serve "
                 "prices on an unauthenticated endpoint.")
         _get_service()          # load the model now; a cold first request is a bug
+        # Same reasoning for the inventory view, which loads the PROMOTED
+        # velocity model and classifies the stock book. Warming it here keeps the
+        # desk's first /inventory call fast and, more importantly, surfaces a
+        # missing or mis-configured velocity model at boot instead of inside
+        # someone's request. Never fatal: pricing must still serve if the
+        # inventory layer cannot build.
+        try:
+            _get_view()
+        except Exception:
+            log.exception("inventory view failed to warm at boot — /inventory/* "
+                          "will retry per request; pricing is unaffected")
         yield
 
     app = FastAPI(
@@ -127,6 +138,66 @@ if FastAPI is not None:
                     "engine is measured against reality continuously.",
         lifespan=_lifespan,
     )
+    # ----------------------------------------------------------------------
+    # EVERY ERROR MUST BE READABLE BY A CLIENT THAT DOES NOTHING CLEVER.
+    #
+    # The desk reported "UNABLE TO GENERATE AI DISCOUNT" with a dialog reading
+    # exactly `[object Object]`. Nothing was broken: a cape-colour stone (O-P)
+    # has no cell on the white Rapaport list, so /price answered 422 with a
+    # genuinely helpful `detail` — error, stone_id, message, and a hint pointing
+    # at the batch endpoint. But `detail` was a DICT, and their CRM renders the
+    # error with the JavaScript equivalent of String(detail), which on any object
+    # is the literal text "[object Object]".
+    #
+    # So the more carefully we structured the error, the less of it they could
+    # read. FastAPI's own request-validation 422 has the same shape (a LIST of
+    # objects) and fails identically.
+    #
+    # Fix on OUR side, because we cannot ship a change to their CRM: `detail` is
+    # always a plain STRING, and the structured fields ride alongside it at the
+    # top level. A naive client prints a sentence; a careful one still gets the
+    # machine-readable parts. This is Trap 9's rule about entry points applied to
+    # the error path — the failure surface is an interface too.
+    # ----------------------------------------------------------------------
+    try:
+        from fastapi.exceptions import RequestValidationError
+        from fastapi.responses import JSONResponse
+        from starlette.exceptions import HTTPException as _StarletteHTTPException
+
+        @app.exception_handler(_StarletteHTTPException)
+        async def _readable_http_error(request: Request, exc):  # noqa: ANN001
+            detail = exc.detail
+            if isinstance(detail, dict):
+                msg = str(detail.get("message") or detail.get("error") or detail)
+                hint = detail.get("hint")
+                if hint:
+                    msg = f"{msg} ({hint})"
+                body = {k: v for k, v in detail.items() if k != "message"}
+                body["detail"] = msg
+                body["message"] = msg
+            else:
+                body = {"detail": str(detail), "message": str(detail)}
+            return JSONResponse(status_code=exc.status_code, content=body,
+                                headers=getattr(exc, "headers", None))
+
+        @app.exception_handler(RequestValidationError)
+        async def _readable_validation_error(request: Request, exc):  # noqa: ANN001
+            # FastAPI's default body is {"detail": [ {...}, {...} ]} — a list of
+            # objects, so it renders as "[object Object]" too. Flatten it to
+            # "Weight: Input should be greater than 0; Color: Field required".
+            parts: list[str] = []
+            for err in exc.errors():
+                loc = ".".join(str(p) for p in err.get("loc", ())
+                               if p not in ("body", "query", "path"))
+                parts.append(f"{loc}: {err.get('msg')}" if loc else str(err.get("msg")))
+            msg = "; ".join(parts) or "invalid request"
+            return JSONResponse(status_code=422,
+                                content={"detail": msg, "message": msg,
+                                         "error": "invalid_request",
+                                         "errors": exc.errors()})
+    except ImportError:  # pragma: no cover - older FastAPI
+        log.warning("Could not install readable error handlers.")
+
     _service: PricingService | None = None
 
     def _get_service() -> PricingService:
@@ -327,10 +398,20 @@ if FastAPI is not None:
                         "stone_id": stone.StoneId or None,
                         "shape": stone.Shape_full, "weight": stone.Weight,
                         "color": stone.Color, "clarity": stone.Clarity,
-                        "message": str(e),
-                        "hint": "Fancy/cape colours have no white Rapaport cell. "
-                                "Use /frontoffice/price for batches — it returns a "
-                                "per-stone Error and never fails the whole book."},
+                        # WRITTEN FOR THE DESK, not for us. `str(e)` ends with
+                        # "Route to attribute-based fallback" — an internal
+                        # instruction that reads to a pricing clerk like the
+                        # system is broken. They see this sentence in a dialog
+                        # box; it has to tell them what to DO.
+                        "message": (
+                            f"{stone.Color} is a cape/fancy colour, and the "
+                            f"Rapaport list we hold covers white D–N only. This "
+                            f"stone has no Rap cell, so there is no discount to "
+                            f"quote against — price it manually."),
+                        "detail_technical": str(e),
+                        "hint": "In a batch, use /frontoffice/price — it prices "
+                                "every other stone and returns this reason on "
+                                "just this row, instead of failing the book."},
             ) from None
 
     @app.post("/price/batch", dependencies=[Depends(require_key)])
@@ -393,14 +474,19 @@ if FastAPI is not None:
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from None
 
-        # Online corrections refresh immediately so a repeated mistake shifts the
-        # next quote without waiting for the nightly retrain.
-        try:
-            from ..feedback.learning import build_corrections
-            from ..feedback import store as fbstore
-            _get_service().engine.set_corrections(build_corrections(fbstore.load_all()))
-        except Exception:
-            log.exception("could not refresh online corrections (decision still stored)")
+        # Online corrections refresh ONLY when feedback is explicitly enabled
+        # (GS_USE_FEEDBACK, the same switch the trainer honours). CLAUDE.md Trap 3:
+        # applying the desk's quotes as corrections measured +0.9 MAE, and with
+        # --workers 2 this call armed only the worker that took the POST, so one
+        # stone priced two ways until the nightly restart. The decision is still
+        # stored either way; only the live price shift is gated.
+        if os.environ.get("GS_USE_FEEDBACK", "0") != "0":
+            try:
+                from ..feedback.learning import build_corrections
+                from ..feedback import store as fbstore
+                _get_service().engine.set_corrections(build_corrections(fbstore.load_all()))
+            except Exception:
+                log.exception("could not refresh online corrections (decision still stored)")
 
         v = variance_pts(d.suggested_discount, human)
         return {
@@ -553,6 +639,206 @@ if FastAPI is not None:
             "Tradeability": tr["label"], "TradeabilityDays": tr["median_days"],
             "Method": f.get("method"),
             "Note": "cell-level discount, priced at the midpoint of the weight range",
+        }
+
+    # ----------------------------------------------------------------
+    # INVENTORY INTELLIGENCE (Workstream B) — JSON endpoints, NOT a screen.
+    #
+    # MOU 7.6: the Angular app is the Workstream-D chat interface only and "is
+    # not a dashboard or analytics UI for Workstreams A-C". MOU 5.1 names the
+    # deliverable "Dashboard data — JSON endpoints". So these payloads ARE the
+    # product and must be complete enough that whoever renders them needs no
+    # business logic of their own: every figure carries its basis, its units and
+    # the run's limitations.
+    #
+    # EVERY ONE OF THESE IS A NEW ENTRY POINT (CLAUDE.md Trap 9).
+    # /inventory/velocity takes stones from a caller, so it builds a `StoneIn` —
+    # the single boundary that runs normalize_shape()/normalize_cps() — instead
+    # of reading the raw strings. The client's systems send RBC/OB/PB and
+    # "EX EX EX", and the last time a new door skipped that step 98% of stones
+    # were affected and nothing failed loudly.
+    # ----------------------------------------------------------------
+    _view: dict = {}
+    _view_lock = __import__("threading").Lock()
+
+    def _get_view(max_age_minutes: float = 180.0):
+        """Cached inventory view, built at most once at a time.
+
+        Building it loads the promoted velocity model and classifies the whole
+        stock book — measured at ~14 s. That is comfortably inside any request
+        timeout, but it is NOT safe to do concurrently: without the lock, ten
+        simultaneous first requests would each build their own copy, so the cost
+        and the memory would multiply by ten at exactly the moment the service is
+        busiest. The lock makes the other nine wait for the first one's result.
+
+        The double check inside the lock matters: by the time a waiter acquires
+        it, the view it was going to build already exists.
+
+        The payload always carries `generated_at`, so a caller can see how old
+        the answer is rather than having to trust that it is current.
+        """
+        import time
+        from ..inventory import chart as CH
+
+        def _fresh() -> bool:
+            return (_view.get("v") is not None
+                    and (time.time() - _view.get("t", 0)) <= max_age_minutes * 60)
+
+        if _fresh():
+            return _view["v"]
+        with _view_lock:
+            if _fresh():                      # built while we waited
+                return _view["v"]
+            _view["v"] = CH.build_view()
+            _view["t"] = time.time()
+            return _view["v"]
+
+    @app.get("/inventory/dashboard", dependencies=[Depends(require_key)])
+    def inventory_dashboard() -> dict:
+        """Everything the dashboard needs, each section self-describing.
+
+        Read-and-recommend only (MOU 11.3): nothing here writes to any client
+        system and no price is applied.
+        """
+        from ..inventory import chart as CH
+        return CH.dashboard(_get_view())
+
+    @app.get("/inventory/heatmap", dependencies=[Depends(require_key)])
+    def inventory_heatmap(min_stones: int = 3) -> dict:
+        """Velocity heatmap: fast<->slow across shape x size x quality.
+
+        Cells with fewer than `min_stones` return a null score and a reason. An
+        empty cell rendered as "slow" would be a lie of omission, and a renderer
+        has no way to know better.
+        """
+        from ..inventory import chart as CH
+        return CH.velocity_heatmap(_get_view(), min_stones=min_stones)
+
+    @app.get("/inventory/ageing", dependencies=[Depends(require_key)])
+    def inventory_ageing() -> dict:
+        """Ageing distribution over the four MOU buckets, by count and by value."""
+        from ..inventory import chart as CH
+        return CH.ageing_distribution(_get_view())
+
+    @app.get("/inventory/capital-at-risk", dependencies=[Depends(require_key)])
+    def inventory_capital_at_risk() -> dict:
+        """Asking value sitting in slow movers and in stale goods.
+
+        Asking value, NOT cost — the feed carries no cost field, and the payload
+        says so rather than letting a renderer label the number "capital".
+        """
+        from ..inventory import chart as CH
+        return CH.capital_at_risk(_get_view())
+
+    @app.get("/inventory/segments", dependencies=[Depends(require_key)])
+    def inventory_segments(limit: int = 200) -> dict:
+        """Per segment: own velocity AND market depth AND their ratio.
+
+        Three separate fields on purpose. MOU 5.2/8.1 forbid a blended score:
+        the gap between how fast Glow Star sells a segment and how deep the
+        broad market is IS the client's edge.
+        """
+        from ..inventory import chart as CH
+        return CH.segment_detail(_get_view(), limit=limit)
+
+    @app.get("/inventory/stock-by-segment", dependencies=[Depends(require_key)])
+    def inventory_stock_by_segment(limit: int = 200) -> dict:
+        """Stock count, asking value and expected days-to-sell per segment."""
+        from ..inventory import chart as CH
+        return CH.stock_by_segment(_get_view(), limit=limit)
+
+    class VelocityQuery(BaseModel):
+        """Stones to assess.
+
+        Shape and CPS are canonicalised by StoneIn's own validators, so this
+        endpoint must never read the raw strings itself (CLAUDE.md Trap 9).
+        """
+        stones: list[StoneIn]
+        age_days: list[float] | None = None
+
+    @app.post("/inventory/velocity", dependencies=[Depends(require_key)])
+    def inventory_velocity(q: VelocityQuery) -> list[dict]:
+        """Expected days-to-sell, class and basis for the stones supplied.
+
+        `age_days` is how long each stone has ALREADY been unsold; supplying it
+        conditions the estimate on that, which is what makes "a stone past its
+        segment median is slowing" arithmetic rather than a rule of thumb.
+        Omitted, it is treated as 0 — the estimate for a stone listed today.
+        """
+        import numpy as _np
+        import pandas as _pd
+        from ..inventory import bifurcate as _BF
+        from ..inventory import survival as _S
+        from ..market.segments import cut_tier as _cut, size_band as _sb
+
+        view = _get_view()
+        ages = q.age_days if q.age_days is not None else [0.0] * len(q.stones)
+        if len(ages) != len(q.stones):
+            raise HTTPException(status_code=422,
+                                detail="age_days must be the same length as stones")
+        asof = view.report.observation_asof or _pd.Timestamp.now().normalize()
+        rows = []
+        for st, age in zip(q.stones, ages):
+            entered = asof - _pd.Timedelta(days=float(age))
+            # st.Shape_full / st.CPS are ALREADY canonical at this point.
+            rows.append({
+                "StoneId": st.StoneId or "", "Status": "Stock",
+                "duration": float(age), "event": 0, "entered": entered,
+                "shape": st.Shape_full, "color": str(st.Color).upper(),
+                "clarity": str(st.Clarity).upper(), "cut_tier": _cut(st.CPS),
+                "fluorescence": str(st.Fluorescence).upper(),
+                "lab": str(st.Lab).upper(), "location": str(st.Location),
+                "weight": float(st.Weight), "size_band": _sb(float(st.Weight)),
+                "rap_ppc": st.Rap, "base_discount": _np.nan,
+                # UNASSESSED (-1.0), never 0.0: 0.0 means assessed and clean.
+                "brown_ord": -1.0, "milky_ord": -1.0,
+                "shade_ord": -1.0, "green_ord": -1.0,
+                "grid_discount": _np.nan, "grid_age_days": _np.nan,
+                "listed_month": float(entered.month),
+            })
+        frame = _pd.DataFrame(rows)
+        frame["segment"] = (frame["shape"] + "|" + frame["size_band"].astype(str)
+                            + "|" + frame["color"] + "|" + frame["clarity"])
+        missing = set(_S.COVARIATES) - set(frame.columns)
+        if missing:      # a covariate was added to the frame and not mapped here
+            raise HTTPException(
+                status_code=500,
+                detail=f"velocity covariates not supplied at this entry point: "
+                       f"{sorted(missing)}")
+        out = _BF.classify_stones(frame, view.model, frame=view.frame)
+        keep = ["StoneId", "Segment", "Class", "ClassFrontOffice", "AgeDays",
+                "AgeingBucket", "ExpectedDaysToSell", "ExpectedDaysLow",
+                "ExpectedDaysHigh", "OwnVelocityScore", "SegmentSales",
+                "ThinSegment", "HorizonLimited", "ClassBasis"]
+        recs = out[keep].astype(object).where(_pd.notna(out[keep]), None).to_dict("records")
+        for r in recs:
+            r["ClassVocabularyNote"] = (
+                "Class uses the MOU wording (Fast/Semi-Fast/Medium/Semi-Slow/"
+                "Slow); ClassFrontOffice is the wording the client's screen "
+                "reads today.")
+        return recs
+
+    @app.get("/inventory/movement", dependencies=[Depends(require_key)])
+    def inventory_movement(days: int = 30, limit: int = 200) -> dict:
+        """The nine inventory-vs-sales cases, per segment.
+
+        A direction is stated only where the segment has enough sales in BOTH
+        periods to support one; thinner segments come back as "insufficient
+        history" rather than being handed a trend they have not earned.
+        """
+        import pandas as _pd
+        from ..inventory import chart as CH
+        from ..reporting import inventory_reports as IR
+
+        view = _get_view()
+        path = IR.build_movement_report(view, days=days)
+        table = _pd.read_excel(path, sheet_name="By segment").head(limit)
+        grid = _pd.read_excel(path, sheet_name="Nine cases")
+        return {
+            "period_days": days,
+            "nine_cases": grid.to_dict("records"),
+            "segments": table.astype(object).where(_pd.notna(table), None).to_dict("records"),
+            "meta": CH._meta(view),
         }
 
     @app.get("/feedback/summary", dependencies=[Depends(require_key)])

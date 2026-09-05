@@ -49,6 +49,17 @@ GRID_HISTORY = DATA_DIR / "master_grid" / "history.json"
 # re-edited) but reported as stale so the caller can widen its interval.
 STALE_AFTER_DAYS = 30
 
+# Cut tiers as the client's grid publishes them, best -> worst. Used ONLY by the
+# cut-tier backoff below; the ordering is what makes "nearest published tier"
+# meaningful.
+_CUT_ORDER: tuple[str, ...] = ("3EX", "EX", "VG-GD", "VG", "GD", "FR")
+
+# Match quality of a returned cell. Exposed so a caller can tell an exact cell
+# from a substituted one — the grid is a FEATURE, and how much to trust it
+# depends on how it was found.
+MATCH_EXACT = 0
+MATCH_CUT_BACKOFF = 1
+
 
 def _cell_key(shape, cell_id: str) -> str:
     return f"{str(shape).upper().strip()}|{cell_id}"
@@ -99,43 +110,145 @@ class GridHistory:
             return None
         return cls(json.loads(p.read_text(encoding="utf-8")))
 
-    def as_of(self, shape, weight: float, color, clarity, cps, fluorescence,
-              asof: str | date | datetime) -> tuple[float | None, int | None]:
-        """(discount, age_days) for this stone's cell as of `asof`, else (None, None).
+    def _read_key(self, key: tuple, weight: float, asof: str):
+        """(discount, age_days) from one exact key, requiring a bracket that
+        CONTAINS the weight. None when the key is absent, the weight falls outside
+        every published bracket, or no containing bracket has an edit before `asof`.
+
+        THE NARROWEST CONTAINING BRACKET DECIDES (ties: lower `lo`, then the
+        earlier-sorted one). The client's grid publishes OVERLAPPING brackets for
+        the same cell: the Master sheet carries narrow slots (0.35-0.39, 0.63-0.64)
+        AND coarse 0.x0-0.x9 overlays, and two non-Master sheets add 0.09-wide
+        ROUND cells that share this key space because the key drops the sheet name.
+
+        MEASURED 2026-09-02 against realized sales (18,939 sold since 2026-03-15,
+        grid read as of the day before each sale):
+
+            rule                              n      grid-vs-sale MAE   within5
+            first containing bracket      18,075        4.94             72.1%
+            narrowest containing bracket  18,075        3.35             80.9%
+            conflict stones only, first    2,127       16.74              9.7%
+            conflict stones only, narrow   2,127        3.17             85.0%
+
+        All 2,127 conflict stones are Round. Through the shipped engine, paired on
+        7,255 stones over six weekly origins: MAE 1.857 -> 1.611 (95% CI on the
+        delta [-0.279, -0.215]), >=5pt tail 6.6% -> 4.7%, better on every origin;
+        fancies and non-conflict rounds moved by refit noise only (<0.03).
+        Confirmed on production: 10 of the 18 worst served-quote misses on
+        2026-09-03 were the coarse overlay winning over the desk's own narrow slot.
+
+        A bracket with no edit before `asof` is skipped, not returned as None —
+        the next-narrowest edited bracket answers instead.
+        """
+        best = None                             # (width, lo, discount, edit_date)
+        for lo, hi, dates, discs in self._idx.get(key, []):
+            if lo <= weight <= hi:
+                i = bisect.bisect_left(dates, asof)
+                if i == 0:
+                    continue                    # bracket exists, but not yet edited
+                cand = (hi - lo, lo, discs[i - 1], dates[i - 1])
+                if best is None or cand[:2] < best[:2]:
+                    best = cand
+        if best is None:
+            return None, None
+        age = None
+        try:
+            age = (datetime.strptime(asof, "%Y-%m-%d")
+                   - datetime.strptime(best[3], "%Y-%m-%d")).days
+        except ValueError:
+            pass
+        return best[2], age
+
+    def as_of_detailed(self, shape, weight: float, color, clarity, cps, fluorescence,
+                       asof: str | date | datetime
+                       ) -> tuple[float | None, int | None, int | None]:
+        """(discount, age_days, match_level) for this stone's cell as of `asof`.
 
         Only edits STRICTLY BEFORE `asof` are visible, so this can never leak a
         value the desk had not yet written when the stone was priced.
+
+        MATCH_CUT_BACKOFF — WHY THIS EXISTS, AND WHY ONLY FOR FANCIES
+        ------------------------------------------------------------
+        The client's grid publishes the `FR` cut for ROUND ONLY. Every fancy sheet
+        carries just 3EX/EX/VG-GD/VG/GD, so a fancy stone whose CPS is a tier the
+        sheet omits has NO cell at all — not because the desk has no view on it,
+        but because that one coordinate is unpublished. Missing the cell is the
+        expensive outcome: measured out-of-time, a fancy stone WITH a cell scores
+        2.73 MAE and one without scores 8.60, with 63% of them >=5 points out.
+
+        Measured on 17,748 sales (2026-03-15 onward), grid cell vs the realized
+        discount, for FANCY shapes:
+            exact cell            n=5198   MAE 4.26   within5 72.8%
+            cut-tier backoff      n= 140   MAE 4.43   within5 76.4%   <- as good
+            fluorescence backoff  n=  13   MAE 12.48  within5  7.7%   <- REFUSED
+            nearest bracket       n= 182   MAE  9.75  within5 36.8%   <- REFUSED
+        So the substituted-cut cell is statistically as informative as a real one,
+        while the other two substitutions are actively misleading and are NOT done.
+
+        ROUND IS DELIBERATELY EXCLUDED. GIA grades overall CUT for round brilliants
+        and the market prices it hard, so swapping the cut tier swaps a genuinely
+        different stone — and the numbers agree: round cut-backoff scored MAE 8.69
+        against 5.20 for an exact cell. `segments.cut_graded()` already encodes
+        exactly this distinction; this uses it rather than inventing a second rule.
+
+        This is STRICTLY ADDITIVE. When an exact cell exists the answer is
+        byte-identical to before, so the 99.4% of rounds and 92.4% of fancies that
+        already resolved are untouched.
         """
         sh = canon_shape(shape)
         if sh is None:
-            return None, None
+            return None, None, None
         if isinstance(asof, (date, datetime)):
             asof = asof.strftime("%Y-%m-%d")
         asof = str(asof)[:10]
+        w = float(weight)
         fl = _FLUOR.get(str(fluorescence or "").strip().upper(), "NON")
-        key = (sh, str(color or "").strip().upper(), str(clarity or "").strip().upper(),
-               str(cps or "").strip().upper(), fl)
-        for lo, hi, dates, discs in self._idx.get(key, []):
-            if lo <= float(weight) <= hi:
-                i = bisect.bisect_left(dates, asof)
-                if i == 0:
-                    return None, None          # cell existed, but not yet on that date
-                age = None
-                try:
-                    age = (datetime.strptime(asof, "%Y-%m-%d")
-                           - datetime.strptime(dates[i - 1], "%Y-%m-%d")).days
-                except ValueError:
-                    pass
-                return discs[i - 1], age
-        return None, None
+        co = str(color or "").strip().upper()
+        cl = str(clarity or "").strip().upper()
+        cu = str(cps or "").strip().upper()
+
+        d, age = self._read_key((sh, co, cl, cu, fl), w, asof)
+        if d is not None:
+            return d, age, MATCH_EXACT
+
+        # Cut-tier backoff — fancies only, and only when the stone's own tier is a
+        # known one. Nearest published tier by rank distance; ties prefer the
+        # BETTER tier, because the grid omits the worst tiers far more often than
+        # the best and a one-step-better cell is the closer comparable.
+        from .segments import cut_graded
+        if not cut_graded(shape) and cu in _CUT_ORDER:
+            i = _CUT_ORDER.index(cu)
+            for j in sorted(range(len(_CUT_ORDER)), key=lambda j: (abs(j - i), j)):
+                if j == i:
+                    continue
+                d, age = self._read_key((sh, co, cl, _CUT_ORDER[j], fl), w, asof)
+                if d is not None:
+                    return d, age, MATCH_CUT_BACKOFF
+        return None, None, None
+
+    def as_of(self, shape, weight: float, color, clarity, cps, fluorescence,
+              asof: str | date | datetime) -> tuple[float | None, int | None]:
+        """(discount, age_days) — see `as_of_detailed`. Kept for existing callers."""
+        d, age, _ = self.as_of_detailed(shape, weight, color, clarity, cps,
+                                        fluorescence, asof)
+        return d, age
 
 
-def attach_grid(df, history: "GridHistory | None", asof=None):
+def attach_grid(df, history: "GridHistory | None", asof=None,
+                date_col: str = "OrderDate_dt"):
     """Add `grid_discount` / `grid_age_days` to `df` (point-in-time).
 
-    `asof=None` uses each row's OWN OrderDate — correct for TRAINING, where every
+    `asof=None` uses each row's own `date_col` — correct for TRAINING, where every
     stone must see only the grid that existed when it sold. Pass an explicit date
     (e.g. today) when SERVING, where the current grid is legitimately available.
+
+    `date_col` selects WHICH per-row date is "point-in-time". It defaults to
+    `OrderDate_dt` (the sale date) because that is what PRICING trains on. The
+    VELOCITY model needs a different one: predicting time-to-sell AT LISTING may
+    only see the grid as it stood on `MarketSheetDate_dt`, so
+    `glowstar.inventory.survival` passes that instead. Using the sale-date grid to
+    predict the time to that same sale is leakage of exactly the kind CLAUDE.md
+    documents.
 
     Silent no-op (columns = NaN) when no history is loaded, so the engine still
     runs — it simply routes every stone to the non-grid model.
@@ -147,23 +260,35 @@ def attach_grid(df, history: "GridHistory | None", asof=None):
     if history is None:
         out["grid_discount"] = np.nan
         out["grid_age_days"] = np.nan
+        out["grid_match_level"] = np.nan
         return out
 
-    discs, ages = [], []
+    discs, ages, levels = [], [], []
     for r in out.itertuples():
-        when = asof if asof is not None else getattr(r, "OrderDate_dt", None)
+        when = asof if asof is not None else getattr(r, date_col, None)
         if when is None or (isinstance(when, float) and pd.isna(when)):
-            discs.append(np.nan); ages.append(np.nan); continue
-        d, a = history.as_of(getattr(r, "Shape_full", None), getattr(r, "Weight", 0.0),
-                             getattr(r, "Color", None), getattr(r, "Clarity", None),
-                             getattr(r, "CPS", None), getattr(r, "Fluorescence", None), when)
+            discs.append(np.nan); ages.append(np.nan); levels.append(np.nan); continue
+        d, a, lv = history.as_of_detailed(
+            getattr(r, "Shape_full", None), getattr(r, "Weight", 0.0),
+            getattr(r, "Color", None), getattr(r, "Clarity", None),
+            getattr(r, "CPS", None), getattr(r, "Fluorescence", None), when)
         discs.append(np.nan if d is None else d)
         ages.append(np.nan if a is None else a)
+        levels.append(np.nan if lv is None else float(lv))
     out["grid_discount"] = discs
     out["grid_age_days"] = ages
-    hit = float(pd.Series(discs).notna().mean()) if len(discs) else 0.0
-    log.info("Grid feature attached: %.1f%% of %d stones have a point-in-time cell.",
-             hit * 100, len(out))
+    # Diagnostic only — NOT a model feature. Adding it to GRID_FEATURES would
+    # change the grid model's matrix width, and every engine already pickled in
+    # the registry would then predict against a schema it was not fit with. That
+    # is the same defect `baseline._fitted_levels` exists to prevent; if this ever
+    # becomes a feature it needs the same guard.
+    out["grid_match_level"] = levels
+    s = pd.Series(discs)
+    hit = float(s.notna().mean()) if len(discs) else 0.0
+    n_backoff = int(pd.Series(levels).eq(float(MATCH_CUT_BACKOFF)).sum())
+    log.info("Grid feature attached: %.1f%% of %d stones have a point-in-time cell"
+             "%s.", hit * 100, len(out),
+             f" ({n_backoff} via cut-tier backoff)" if n_backoff else "")
     return out
 
 

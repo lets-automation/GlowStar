@@ -8,6 +8,7 @@ dict. This is the callable the REST layer (service/app.py) wraps.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import asdict
 
 import pandas as pd
@@ -345,5 +346,12 @@ class PricingService:
         )
         fbstore.record(rec)
         self._feedback = fbstore.load_all()
-        self.engine.set_corrections(build_corrections(self._feedback))   # immediate effect
+        # Online corrections refresh ONLY when feedback is explicitly enabled.
+        # CLAUDE.md Trap 3: the desk's price is a quote, not a sale; measured
+        # +0.9 MAE when applied, and build_corrections(min_support=3) shifts a
+        # whole cell off three stones. Before this guard, ONE decision POST armed
+        # corrections in whichever uvicorn worker took it, so the same stone then
+        # priced two ways until the nightly restart. Same switch as the trainer.
+        if os.environ.get("GS_USE_FEEDBACK", "0") != "0":
+            self.engine.set_corrections(build_corrections(self._feedback))
         return {"recorded": True, "feedback_summary": reason_summary(self._feedback)}

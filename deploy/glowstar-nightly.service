@@ -16,7 +16,7 @@ ExecStart=/opt/glowstar/.venv/bin/python -m glowstar.training.retrain
 # Drift alarm: compare what we PUBLISHED against what actually happened.
 # Prefixed '-' so a monitoring failure can never fail the retrain that matters.
 ExecStart=-/opt/glowstar/.venv/bin/python -m glowstar.monitoring.drift
-ExecStart=/opt/glowstar/deploy/backup.sh
+ExecStart=-/opt/glowstar/deploy/backup.sh
 # PICK UP THE MODEL WE JUST PROMOTED.
 #
 # `PricingService` loads the model ONCE per uvicorn worker and there is no

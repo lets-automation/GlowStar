@@ -622,6 +622,56 @@ def test_every_trained_shape_value_survives_normalisation():
     assert not lost, f"normalisation destroys trained shapes: {lost}"
 
 
+def test_every_client_shape_code_lands_on_a_name_the_model_knows():
+    """THE OTHER DIRECTION, which is the one that was missing.
+
+    The test above proves trained NAMES survive normalisation. Nothing proved the
+    converse: that every CODE the client's systems actually send comes OUT as a
+    name the model was trained on. It did not — `CL` (Cushion Long, 162 stones),
+    `DUTCH MARQUISE`, `HEART MODIFIED` and `PEAR MODIFIED` all passed straight
+    through, matched no trained level, and dropped to the median fallback. Every
+    one of them is a fancy shape, which is why it presented as "fancy is very
+    bad" rather than as a general fault. `CL` and `PEAR MODIFIED` are both in the
+    served-quote audit trail, so this was live.
+
+    The client's feed carries BOTH columns, so the expected answer is not a guess:
+    `Shape` -> `Shape_full` is 1:1 in their own records. A code whose TARGET has
+    too little history is still allowed to be rare — that is honest — but the
+    NAME must be right.
+    """
+    from glowstar.data.loaders import load_records, sold_stones
+    from glowstar.reference.normalize import normalize_shape
+    df = load_records()[0]
+    assert {"Shape", "Shape_full"} <= set(df.columns)
+
+    ambiguous = df.groupby("Shape")["Shape_full"].nunique()
+    assert not len(ambiguous[ambiguous > 1]), (
+        "a shape code maps to more than one name in the client's own feed; the "
+        f"table below cannot be derived from it: {ambiguous[ambiguous > 1].to_dict()}")
+
+    expected = df.groupby("Shape")["Shape_full"].agg(lambda s: s.mode().iloc[0])
+    # Only where the paired name is a level the model has actually SEEN. When it
+    # has zero history, emitting the name would hand HistGradientBoosting a
+    # category it never trained on — so passing the code through untouched is the
+    # correct answer, and `test_no_normaliser_can_emit_a_value_the_model_never_saw`
+    # is the guard that keeps it that way.
+    seen = set(sold_stones(df, drop_outliers=True)["Shape_full"].dropna().astype(str))
+    wrong = {code: (normalize_shape(code), name)
+             for code, name in expected.items()
+             if name in seen and normalize_shape(code) != name}
+    assert not wrong, (
+        "normalize_shape() disagrees with the client's own code->name pairing "
+        f"(code: got != expected): {wrong}")
+
+    # And the four that must reach the model rather than the fallback.
+    trained = sold_stones(df, drop_outliers=True)["Shape_full"].value_counts()
+    for code in ("CL", "DUTCH MARQUISE", "HEART MODIFIED", "PEAR MODIFIED"):
+        name = normalize_shape(code)
+        assert trained.get(name, 0) >= 30, (
+            f"{code!r} -> {name!r} has only {trained.get(name, 0)} training rows, "
+            "so it would still be flagged rare_shape and routed to the fallback")
+
+
 # --- Rap omitted + Rap cell recently moved = 500 ---------------------------
 # Rap is OPTIONAL on StoneIn and resolved server-side, which is the documented
 # call pattern and the only one FrontOffice uses. `_apply_rap_change` read

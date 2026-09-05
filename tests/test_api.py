@@ -238,12 +238,17 @@ def test_fancy_colour_returns_a_structured_422_not_a_500(monkeypatch):
     r = c.post("/price", json={"Shape_full": "Cushion", "Weight": 1.03,
                                "Color": "Fancy Intense Yellow", "Clarity": "VVS2"})
     assert r.status_code == 422, "an unpriceable stone must not be a server error"
-    d = r.json()["detail"]
-    assert d["error"] == "not_priceable"
+    b = r.json()
+    # `detail` is a STRING. It used to be this same dict, which is exactly how
+    # the desk ended up staring at "[object Object]" a second time: the CRM
+    # renders errors with String(detail), and String({...}) discards everything.
+    # The structured fields now ride alongside it at the top level.
+    assert isinstance(b["detail"], str), "detail must be a sentence, not an object"
+    assert b["error"] == "not_priceable"
     # the caller must be told WHICH stone and WHY, or they cannot skip it
-    assert d["color"] == "Fancy Intense Yellow"
-    assert "white" in d["message"].lower()
-    assert "frontoffice" in d["hint"]
+    assert b["color"] == "Fancy Intense Yellow"
+    assert "white" in b["detail"].lower()
+    assert "frontoffice" in b["hint"]
 
 
 def test_a_batch_survives_a_stone_it_cannot_price(monkeypatch):
@@ -328,3 +333,77 @@ def test_health_reports_every_problem_not_just_the_last_one(client, monkeypatch)
     joined = " ".join(warns)
     assert "is promoted" in joined and "grid" in joined and "days old" in joined
     assert body["warning"] == "; ".join(warns), "the legacy string key must still work"
+
+
+# --- an error a naive client cannot read is an outage -----------------------
+# THE DESK SAW: "UNABLE TO GENERATE AI DISCOUNT", dialog body `[object Object]`.
+# Nothing was broken. A cape-colour stone (O-P) has no white-Rapaport cell, so
+# /price answered 422 with a carefully structured `detail` dict — error,
+# stone_id, message, hint. Their CRM renders errors with the JS equivalent of
+# String(detail), and String({...}) is literally "[object Object]".
+#
+# The better we structured the error, the less of it they could read. FastAPI's
+# own request-validation 422 has the same defect (a LIST of objects).
+
+def _is_object_object(body: dict) -> bool:
+    """True if a client doing String(body['detail']) would print [object Object]."""
+    return isinstance(body.get("detail"), (dict, list))
+
+
+def test_cape_colour_error_is_a_sentence_not_an_object(monkeypatch):
+    """O-P is a REAL colour from the client's live Inventory Pricing screen.
+
+    Uses the real service, not the fake — the fake prices anything, so it can
+    never reach the branch that produced the dialog.
+    """
+    from fastapi.testclient import TestClient
+    from glowstar.service import app as app_mod
+    monkeypatch.delenv("GS_API_KEY", raising=False)
+    r = TestClient(app_mod.app).post(
+        "/price", json={"StoneId": "ARO-111", "Shape_full": "RBC",
+                        "Weight": 0.7, "Color": "O-P", "Clarity": "IF",
+                        "CPS": "GD-EX-GD", "Fluorescence": "FNT"})
+    assert r.status_code == 422
+    body = r.json()
+    assert not _is_object_object(body), \
+        "detail is an object — the desk sees '[object Object]' again"
+    assert "cape" in body["detail"].lower() or "O-P" in body["detail"]
+    assert "manual" in body["detail"].lower(), \
+        "the message must tell the desk what to DO, not just what failed"
+    # the machine-readable parts must survive alongside the sentence
+    assert body["error"] == "not_priceable" and body["stone_id"] == "ARO-111"
+    assert "Route to attribute-based fallback" not in body["detail"], \
+        "internal routing instructions must not reach a pricing clerk"
+
+
+def test_validation_errors_are_also_readable(client):
+    """FastAPI's default 422 body is a LIST of objects — same failure."""
+    r = client.post("/price", json={"StoneId": "Y"})
+    assert r.status_code == 422
+    body = r.json()
+    assert not _is_object_object(body)
+    assert "Field required" in body["detail"]
+    assert "Weight" in body["detail"], "name the field the caller got wrong"
+    assert body["error"] == "invalid_request"
+
+
+def test_no_endpoint_returns_an_unreadable_error(client):
+    """Sweep the error surface: nothing may answer with a bare object."""
+    cases = [
+        ("/price", {"StoneId": "X", "Shape_full": "RBC", "Weight": -1,
+                    "Color": "G", "Clarity": "VS1"}),
+        ("/price", {"StoneId": "Y"}),
+        ("/price", {"StoneId": "C", "Shape_full": "RBC", "Weight": 0.7,
+                    "Color": "Q-R", "Clarity": "SI1"}),
+        ("/price/batch", [{"StoneId": "Z", "Shape_full": "RBC", "Weight": 0.5,
+                           "Color": "G", "Clarity": "VS1"}] * 5001),
+        ("/frontoffice/price", [{"stoneId": "B"}]),
+    ]
+    for path, payload in cases:
+        r = client.post(path, json=payload)
+        if r.status_code < 400:
+            continue
+        body = r.json()
+        assert not _is_object_object(body), f"{path} -> [object Object]"
+        assert isinstance(body.get("detail"), str) and body["detail"], \
+            f"{path} -> empty or non-string detail"
